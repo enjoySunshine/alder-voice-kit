@@ -1,0 +1,2715 @@
+import { config as chaiConfig, expect, use } from 'chai';
+import sinon from 'sinon';
+import sinonChai from 'sinon-chai';
+import AudioStreamController from '../../../src/controller/audio-stream-controller';
+import { Events } from '../../../src/events';
+import Hls from '../../../src/hls';
+import { Fragment, Part } from '../../../src/loader/fragment';
+import { LevelDetails } from '../../../src/loader/level-details';
+import { LoadStats } from '../../../src/loader/load-stats';
+import M3U8Parser from '../../../src/loader/m3u8-parser';
+import { Level } from '../../../src/types/level';
+import { PlaylistLevelType } from '../../../src/types/loader';
+import { AttrList } from '../../../src/utils/attr-list';
+import {
+  addSliding,
+  adjustSliding,
+  computeReloadInterval,
+  mapFragmentIntersection,
+  mapPartIntersection,
+  mergeDetails,
+} from '../../../src/utils/level-helper';
+import { logger } from '../../../src/utils/logger';
+import type { MediaFragment } from '../../../src/loader/fragment';
+import type {
+  ComponentAPI,
+  NetworkComponentAPI,
+} from '../../../src/types/component-api';
+import type {
+  AudioPlaylistType,
+  MediaAttributes,
+  MediaPlaylist,
+} from '../../../src/types/media-playlist';
+
+use(sinonChai);
+chaiConfig.truncateThreshold = 0;
+
+type HlsTestable = Omit<Hls, 'networkControllers' | 'coreComponents'> & {
+  coreComponents: ComponentAPI[];
+  networkControllers: NetworkComponentAPI[];
+};
+
+const generatePlaylist = (sequenceNumbers, offset = 0, duration = 5) => {
+  const playlist = new LevelDetails('');
+  playlist.startSN = sequenceNumbers[0];
+  playlist.endSN = sequenceNumbers[sequenceNumbers.length - 1];
+  playlist.targetduration = duration + 1;
+  playlist.averagetargetduration = duration;
+  playlist.fragments = sequenceNumbers.map((n, i) => {
+    const frag = new Fragment(PlaylistLevelType.MAIN, '');
+    frag.sn = n;
+    frag.setStart(i * 5 + offset);
+    frag.duration = duration;
+    return frag;
+  });
+  return playlist;
+};
+
+const getIteratedSequence = (oldPlaylist, newPlaylist) => {
+  const actual: number[] = [];
+  mapFragmentIntersection(oldPlaylist, newPlaylist, (oldFrag, newFrag) => {
+    if (oldFrag.sn !== newFrag.sn) {
+      throw new Error('Expected old frag and new frag to have the same SN');
+    }
+    actual.push(newFrag.sn as number);
+  });
+  return actual;
+};
+
+const getFragmentSequenceNumbers = (details: LevelDetails) =>
+  details.fragments
+    .map((f: MediaFragment | null) => `${f?.sn}-${f?.cc}`)
+    .join(',');
+
+describe('LevelHelper Tests', function () {
+  let sandbox;
+  beforeEach(function () {
+    sandbox = sinon.createSandbox();
+  });
+
+  afterEach(function () {
+    sandbox.restore();
+  });
+
+  describe('mapSegmentIntersection', function () {
+    it('iterates over the intersection of the fragment arrays', function () {
+      const oldPlaylist = generatePlaylist([1, 2, 3, 4, 5]);
+      const newPlaylist = generatePlaylist([3, 4, 5, 6, 7]);
+      const actual = getIteratedSequence(oldPlaylist, newPlaylist);
+      expect(actual).to.deep.equal([3, 4, 5]);
+    });
+
+    it('can iterate with one overlapping fragment', function () {
+      const oldPlaylist = generatePlaylist([1, 2, 3, 4, 5]);
+      const newPlaylist = generatePlaylist([5, 6, 7, 8, 9]);
+      const actual = getIteratedSequence(oldPlaylist, newPlaylist);
+      expect(actual).to.deep.equal([5]);
+    });
+
+    it('can iterate over the entire segment array', function () {
+      const oldPlaylist = generatePlaylist([1, 2, 3]);
+      const newPlaylist = generatePlaylist([1, 2, 3]);
+      const actual = getIteratedSequence(oldPlaylist, newPlaylist);
+      expect(actual).to.deep.equal([1, 2, 3]);
+    });
+
+    it('can iterate when overlapping happens at the start of the old playlist', function () {
+      const oldPlaylist = generatePlaylist([5, 6, 7, 8]);
+      const newPlaylist = generatePlaylist([3, 4, 5, 6]);
+      const actual = getIteratedSequence(oldPlaylist, newPlaylist);
+      expect(actual).to.deep.equal([5, 6]);
+    });
+
+    it('never executes the callback if no intersection exists', function () {
+      const oldPlaylist = generatePlaylist([1, 2, 3, 4, 5]);
+      const newPlaylist = generatePlaylist([10, 11, 12]);
+      const actual = getIteratedSequence(oldPlaylist, newPlaylist);
+      expect(actual).to.deep.equal([]);
+    });
+  });
+
+  describe('mapPartIntersection', function () {
+    it('finds overlapping parts and executes callback for each', function () {
+      const oldFrags = generatePlaylist([1, 2, 3]).fragments;
+      const newFrags = generatePlaylist([2, 3, 4]).fragments;
+      const attr = new AttrList('DURATION=1');
+      const oldParts: Part[] = [
+        new Part(attr, oldFrags[1], '', 0),
+        new Part(attr, oldFrags[1], '', 1),
+        new Part(attr, oldFrags[1], '', 2),
+        new Part(attr, oldFrags[2], '', 0),
+        new Part(attr, oldFrags[2], '', 1),
+        new Part(attr, oldFrags[2], '', 2),
+      ];
+      const newParts: Part[] = [
+        new Part(attr, newFrags[1], '', 0),
+        new Part(attr, newFrags[1], '', 1),
+        new Part(attr, newFrags[1], '', 2),
+        new Part(attr, newFrags[2], '', 0),
+        new Part(attr, newFrags[2], '', 1),
+        new Part(attr, newFrags[2], '', 2),
+      ];
+      const intersectionFn = sinon.spy();
+      mapPartIntersection(oldParts, newParts, intersectionFn);
+      expect(intersectionFn).to.have.been.calledThrice;
+      expect(intersectionFn.firstCall).to.have.been.calledWith(
+        oldParts[3],
+        newParts[0],
+      );
+      expect(intersectionFn.secondCall).to.have.been.calledWith(
+        oldParts[4],
+        newParts[1],
+      );
+      expect(intersectionFn.thirdCall).to.have.been.calledWith(
+        oldParts[5],
+        newParts[2],
+      );
+    });
+
+    it('does not read beyond the old parts array', function () {
+      const oldFrags = generatePlaylist([1]).fragments;
+      const attr = new AttrList('DURATION=1');
+      const oldParts: Part[] = [new Part(attr, oldFrags[0], '', 0)];
+      const newParts: Part[] = [new Part(attr, oldFrags[0], '', 0)];
+
+      const guardedOldParts = new Proxy(oldParts, {
+        get(target, property, receiver) {
+          if (property === String(target.length)) {
+            throw new Error('Out-of-bounds part access');
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+
+      const intersectionFn = sinon.spy();
+      expect(() =>
+        mapPartIntersection(guardedOldParts, newParts, intersectionFn),
+      ).not.to.throw();
+      expect(intersectionFn).to.have.been.calledOnce;
+    });
+  });
+
+  describe('adjustSliding', function () {
+    // generatePlaylist creates fragments with a duration of 5 seconds
+    it('adds the start time of the first comment segment to all other segment', function () {
+      const oldPlaylist = generatePlaylist([1, 2, 3]); // start times: 0, 5, 10
+      const newPlaylist = generatePlaylist([3, 4, 5]);
+      adjustSliding(oldPlaylist, newPlaylist);
+      const actual = newPlaylist.fragments.map((f) => f.start);
+      expect(actual).to.deep.equal([10, 15, 20]);
+    });
+
+    it('applies expected sliding when no common segments exist', function () {
+      const oldPlaylist = generatePlaylist([1, 2, 3]);
+      const newPlaylist = generatePlaylist([5, 6, 7]);
+      adjustSliding(oldPlaylist, newPlaylist);
+      const actual = newPlaylist.fragments.map((f) => f.start);
+      expect(actual).to.deep.equal([20, 25, 30]);
+    });
+
+    it('applies minimal sliding when segments meet but do not overlap', function () {
+      const oldPlaylist = generatePlaylist([1, 2, 3]);
+      const newPlaylist = generatePlaylist([4, 5, 6]);
+      adjustSliding(oldPlaylist, newPlaylist);
+      const actual = newPlaylist.fragments.map((f) => f.start);
+      expect(actual).to.deep.equal([15, 20, 25]);
+    });
+  });
+
+  describe('mergeDetails', function () {
+    it('transfers start times where segments overlap, and extrapolates the start of any new segment', function () {
+      const oldPlaylist = generatePlaylist([1, 2, 3, 4]); // start times: 0, 5, 10, 15
+      const newPlaylist = generatePlaylist([2, 3, 4, 5]);
+      mergeDetails(oldPlaylist, newPlaylist, logger);
+      const actual = newPlaylist.fragments.map((f) => f.start);
+      expect(actual).to.deep.equal([5, 10, 15, 20]);
+      expect(newPlaylist.playlistParsingError).to.be.null;
+    });
+
+    it('carries a gap set on a fragment to the refreshed playlist', function () {
+      const oldPlaylist = generatePlaylist([1, 2, 3, 4]);
+      oldPlaylist.fragments[1].gap = true;
+      const newPlaylist = generatePlaylist([2, 3, 4, 5]);
+      mergeDetails(oldPlaylist, newPlaylist, logger);
+      expect(newPlaylist.fragments.map((f) => !!f.gap)).to.deep.equal([
+        true,
+        false,
+        false,
+        false,
+      ]);
+    });
+
+    it('aligns cc to the previous playlist when a discontinuity rolls out with no overlap', function () {
+      const oldPlaylist = parseLevelPlaylist(`#EXTM3U
+#EXT-X-VERSION:9
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:1
+#EXTINF:6,
+1.mp4
+#EXTINF:6,
+2.mp4
+#EXT-X-DISCONTINUITY
+#EXTINF:6,
+3.mp4
+#EXTINF:6,
+4.mp4
+#EXT-X-DISCONTINUITY
+#EXTINF:6,
+5.mp4
+#EXTINF:6,
+6.mp4
+`);
+      const newPlaylist = parseLevelPlaylist(`#EXTM3U
+#EXT-X-VERSION:9
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:9
+#EXTINF:6,
+9.mp4
+#EXTINF:6,
+10.mp4
+#EXTINF:6,
+11.mp4
+#EXTINF:6,
+12.mp4
+#EXTINF:6,
+13.mp4
+#EXTINF:6,
+14.mp4
+`);
+      expect(getFragmentSequenceNumbers(oldPlaylist), 'old parsed').to.equal(
+        '1-0,2-0,3-1,4-1,5-2,6-2',
+      );
+      expect(getFragmentSequenceNumbers(newPlaylist), 'new parsed').to.equal(
+        '9-0,10-0,11-0,12-0,13-0,14-0',
+      );
+
+      mergeDetails(oldPlaylist, newPlaylist, logger);
+
+      expect(getFragmentSequenceNumbers(newPlaylist), 'merged').to.equal(
+        '9-2,10-2,11-2,12-2,13-2,14-2',
+      );
+      expect(newPlaylist).to.include({ startCC: 2, endCC: 2 });
+    });
+
+    it('applies expected sliding when there is no segment overlap', function () {
+      const oldPlaylist = generatePlaylist([1, 2, 3]);
+      const newPlaylist = generatePlaylist([5, 6, 7]);
+      mergeDetails(oldPlaylist, newPlaylist, logger);
+      const actual = newPlaylist.fragments.map((f) => f.start);
+      expect(actual).to.deep.equal([20, 25, 30]);
+      expect(newPlaylist.playlistParsingError).to.be.null;
+    });
+
+    it('matches start when the new playlist starts before the old', function () {
+      const oldPlaylist = generatePlaylist([3, 4, 5]);
+      oldPlaylist.fragments.forEach((f) => {
+        f.addStart(10);
+      });
+      const newPlaylist = generatePlaylist([1, 2, 3]);
+      mergeDetails(oldPlaylist, newPlaylist, logger);
+      const actual = newPlaylist.fragments.map((f) => f.start);
+      expect(actual).to.deep.equal([10, 15, 20]);
+      expect(newPlaylist.playlistParsingError).to.be.null;
+    });
+
+    it('merges delta playlist updates', function () {
+      const oldPlaylist = generatePlaylist([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+      const newPlaylist = generatePlaylist([10, 11, 12]);
+      newPlaylist.skippedSegments = 7;
+      newPlaylist.startSN = 3;
+      // @ts-ignore
+      newPlaylist.fragments.unshift(null, null, null, null, null, null, null);
+      const merged = generatePlaylist([3, 4, 5, 6, 7, 8, 9, 10, 11, 12], 10);
+      mergeDetails(oldPlaylist, newPlaylist, logger);
+      expect(newPlaylist.deltaUpdateFailed).to.equal(false);
+      expect(newPlaylist.fragments.length).to.equal(merged.fragments.length);
+      newPlaylist.fragments.forEach((frag, i) => {
+        expect(
+          frag,
+          `Fragment sn: ${frag.sn} does not match expected:
+actual: ${JSON.stringify(frag)}
+expect: ${JSON.stringify(merged.fragments[i])}`,
+        ).to.deep.equal(merged.fragments[i]);
+      });
+      expect(newPlaylist.playlistParsingError).to.be.null;
+    });
+
+    it('marks failed delta playlist updates', function () {
+      const oldPlaylist = generatePlaylist([1, 2, 3, 4, 5, 6, 7, 8]);
+      const newPlaylist = generatePlaylist([10, 11, 12]);
+      newPlaylist.skippedSegments = 5;
+      newPlaylist.startSN = 5;
+      // @ts-ignore
+      newPlaylist.fragments.unshift(null, null, null, null, null);
+      // FIXME: An expected offset of 50 would be preferred, but there is nothing to sync playlist start with
+      const merged = generatePlaylist([10, 11, 12], 0);
+      mergeDetails(oldPlaylist, newPlaylist, logger);
+      expect(newPlaylist.deltaUpdateFailed).to.equal(true);
+      expect(newPlaylist.fragments.length).to.equal(3);
+      newPlaylist.fragments.forEach((frag, i) => {
+        expect(
+          frag,
+          `Fragment sn: ${frag.sn} does not match expected:
+actual: ${JSON.stringify(frag)}
+expect: ${JSON.stringify(merged.fragments[i])}`,
+        ).to.deep.equal(merged.fragments[i]);
+      });
+      expect(newPlaylist.playlistParsingError).to.be.null;
+    });
+
+    it('merges initSegments', function () {
+      const oldPlaylist = generatePlaylist([1, 2, 3]);
+      const oldInitSegment = new Fragment(PlaylistLevelType.MAIN, '');
+      oldInitSegment.sn = 'initSegment';
+      oldInitSegment.relurl = 'init.mp4';
+      oldPlaylist.fragments.forEach((frag) => {
+        frag.initSegment = oldInitSegment;
+      });
+      oldPlaylist.fragmentHint = new Fragment(
+        PlaylistLevelType.MAIN,
+        '',
+      ) as MediaFragment;
+      oldPlaylist.fragmentHint.sn = 4;
+      oldPlaylist.fragmentHint.initSegment = oldInitSegment;
+
+      const newPlaylist = generatePlaylist([2, 3, 4]);
+      const newInitSegment = new Fragment(PlaylistLevelType.MAIN, '');
+      newInitSegment.sn = 'initSegment';
+      newInitSegment.relurl = 'init.mp4';
+      newPlaylist.fragments.forEach((frag) => {
+        frag.initSegment = newInitSegment;
+      });
+      newPlaylist.fragmentHint = new Fragment(
+        PlaylistLevelType.MAIN,
+        '',
+      ) as MediaFragment;
+      newPlaylist.fragmentHint.sn = 5;
+      newPlaylist.fragmentHint.initSegment = newInitSegment;
+
+      mergeDetails(oldPlaylist, newPlaylist, logger);
+
+      newPlaylist.fragments.forEach((frag, i) => {
+        expect(
+          frag.initSegment,
+          `Fragment sn: ${frag.sn} does not have correct initSegment`,
+        ).to.equal(oldInitSegment);
+      });
+      expect(
+        newPlaylist.fragmentHint.initSegment,
+        'fragmentHint does not have correct initSegment',
+      ).to.equal(oldInitSegment);
+      expect(newPlaylist.playlistParsingError).to.be.null;
+    });
+
+    it('handles delta Playlist updates with merged program date time and skipped date ranges', function () {
+      const playlist = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-MEDIA-SEQUENCE:3
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36.0,CAN-SKIP-DATERANGES=YES,CAN-BLOCK-RELOAD=YES,HOLDBACK=18,PART-HOLDBACK=3
+#EXTINF:6,
+fileSequence3.ts
+#EXT-X-DATERANGE:ID="one",START-DATE="2024-02-29T12:00:04.000Z"
+#EXT-X-MAP:URI="map.ts\
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="key.bin"
+#EXT-X-PROGRAM-DATE-TIME:2024-02-29T12:00:06.000Z
+#EXTINF:6,
+fileSequence4.ts
+#EXT-X-BITRATE:2000
+#EXT-X-DISCONTINUITY
+#EXT-X-PROGRAM-DATE-TIME:2024-02-29T12:01:00.000Z
+#EXTINF:6,
+fileSequence5.ts
+#EXT-X-DATERANGE:ID="two",START-DATE="2024-02-29T12:00:10.000Z"
+#EXTINF:6,
+fileSequence6.ts
+#EXTINF:6,
+fileSequence7.ts
+#EXTINF:6,
+fileSequence8.ts
+#EXTINF:6,
+fileSequence9.ts
+#EXTINF:6,
+fileSequence10.ts
+#EXT-X-DATERANGE:ID="three",START-DATE="2024-02-29T12:01:04.000Z"`;
+      const playlistUpdate = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-MEDIA-SEQUENCE:4
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36.0,CAN-SKIP-DATERANGES=YES,CAN-BLOCK-RELOAD=YES,HOLDBACK=18,PART-HOLDBACK=3
+#EXT-X-SKIP:SKIPPED-SEGMENTS=3
+#EXTINF:6,
+fileSequence7.ts
+#EXTINF:6,
+fileSequence8.ts
+#EXTINF:6,
+fileSequence9.ts
+#EXTINF:6,
+fileSequence10.ts
+#EXT-X-DATERANGE:ID="three",START-DATE="2024-02-29T12:01:04.000Z"
+#EXTINF:6,
+fileSequence11.ts
+#EXT-X-DATERANGE:ID="four",START-DATE="2024-02-29T12:02:04.000Z"`;
+      const details = parseLevelPlaylist(playlist);
+      const detailsUpdated = parseLevelPlaylist(playlistUpdate);
+      mergeDetails(details, detailsUpdated, logger);
+      expect(details.hasProgramDateTime, 'details.hasProgramDateTime').to.be
+        .true;
+      expect(details.dateRanges, 'one')
+        .to.have.property('one')
+        .which.has.property('tagAnchor')
+        .which.equals(details.fragments[1].ref)
+        .which.has.property('sn')
+        .which.equals(4);
+      expect(details.dateRanges, 'two')
+        .to.have.property('two')
+        .which.has.property('tagAnchor')
+        .which.equals(details.fragments[1].ref)
+        .which.has.property('sn')
+        .which.equals(4);
+      expect(details.dateRanges, 'three')
+        .to.have.property('three')
+        .which.has.property('tagAnchor')
+        .which.equals(details.fragments[2].ref)
+        .which.has.property('sn')
+        .which.equals(5);
+      expect(details.dateRanges.one!.startTime).to.equal(4);
+      expect(details.dateRanges.two!.startTime).to.equal(10);
+      expect(details.dateRanges.three!.startTime).to.equal(16);
+      expect(details.dateRanges.one!.tagOrder, 'one.tagOrder').to.equal(0);
+      expect(details.dateRanges.two!.tagOrder, 'two.tagOrder').to.equal(1);
+      expect(details.dateRanges.three!.tagOrder, 'three.tagOrder').to.equal(2);
+      expect(
+        detailsUpdated.hasProgramDateTime,
+        'detailsUpdated.hasProgramDateTime',
+      ).to.be.true;
+      expect(detailsUpdated.dateRanges, 'one updated')
+        .to.have.property('one')
+        .which.has.property('tagAnchor')
+        .which.equals(detailsUpdated.fragments[0].ref)
+        .which.has.property('sn')
+        .which.equals(4);
+      expect(detailsUpdated.dateRanges, 'two updated')
+        .to.have.property('two')
+        .which.has.property('tagAnchor')
+        .which.equals(detailsUpdated.fragments[0].ref)
+        .which.has.property('sn')
+        .which.equals(4);
+      expect(detailsUpdated.dateRanges, 'three updated')
+        .to.have.property('three')
+        .which.has.property('tagAnchor')
+        .which.equals(detailsUpdated.fragments[1].ref)
+        .which.has.property('sn')
+        .which.equals(5);
+      expect(detailsUpdated.dateRanges, 'four')
+        .to.have.property('four')
+        .which.has.property('tagAnchor')
+        .which.has.property('sn')
+        .which.equals(5);
+      expect(detailsUpdated.dateRanges.one!.startTime).to.equal(4);
+      expect(detailsUpdated.dateRanges.two!.startTime).to.equal(10);
+      expect(detailsUpdated.dateRanges.three!.startTime).to.equal(16);
+      expect(detailsUpdated.dateRanges.four!.startTime).to.equal(76);
+      expect(
+        detailsUpdated.dateRanges.one!.tagOrder,
+        'one.tagOrder updated',
+      ).to.equal(0);
+      expect(
+        detailsUpdated.dateRanges.two!.tagOrder,
+        'two.tagOrder updated',
+      ).to.equal(1);
+      expect(
+        detailsUpdated.dateRanges.three!.tagOrder,
+        'three.tagOrder updated',
+      ).to.equal(2);
+      expect(
+        detailsUpdated.dateRanges.four!.tagOrder,
+        'four.tagOrder',
+      ).to.equal(3);
+      expect(detailsUpdated.playlistParsingError).to.be.null;
+    });
+
+    it('handles delta Playlist updates with discontinuities', function () {
+      const playlist = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-DISCONTINUITY-SEQUENCE:0
+#EXTINF:6,
+fileSequence0.ts
+#EXTINF:6,
+fileSequence1.ts
+#EXT-X-DISCONTINUITY
+#EXTINF:6,
+fileSequence2.ts
+#EXTINF:6,
+fileSequence3.ts
+#EXTINF:6,
+fileSequence4.ts
+#EXTINF:6,
+fileSequence5.ts
+#EXTINF:6,
+fileSequence6.ts
+#EXTINF:6,
+fileSequence7.ts
+#EXTINF:6,
+fileSequence8.ts
+#EXTINF:6,
+fileSequence9.ts`;
+      const deltaUpdate1 = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-DISCONTINUITY-SEQUENCE:0
+#EXT-X-SKIP:SKIPPED-SEGMENTS=3
+#EXTINF:6,
+fileSequence3.ts
+#EXTINF:6,
+fileSequence4.ts
+#EXTINF:6,
+fileSequence5.ts
+#EXTINF:6,
+fileSequence6.ts
+#EXTINF:6,
+fileSequence7.ts
+#EXTINF:6,
+fileSequence8.ts
+#EXTINF:6,
+fileSequence9.ts`;
+      const deltaUpdate2 = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36
+#EXT-X-MEDIA-SEQUENCE:1
+#EXT-X-DISCONTINUITY-SEQUENCE:0
+#EXT-X-SKIP:SKIPPED-SEGMENTS=3
+#EXTINF:6,
+fileSequence4.ts
+#EXTINF:6,
+fileSequence5.ts
+#EXTINF:6,
+fileSequence6.ts
+#EXTINF:6,
+fileSequence7.ts
+#EXTINF:6,
+fileSequence8.ts
+#EXTINF:6,
+fileSequence9.ts
+#EXTINF:6,
+fileSequence10.ts`;
+      const deltaUpdate3 = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36
+#EXT-X-MEDIA-SEQUENCE:3
+#EXT-X-DISCONTINUITY-SEQUENCE:1
+#EXT-X-SKIP:SKIPPED-SEGMENTS=3
+#EXTINF:6,
+fileSequence6.ts
+#EXTINF:6,
+fileSequence7.ts
+#EXTINF:6,
+fileSequence8.ts
+#EXTINF:6,
+fileSequence9.ts
+#EXTINF:6,
+fileSequence10.ts
+#EXTINF:6,
+fileSequence11.ts
+#EXT-X-DISCONTINUITY
+#EXTINF:6,
+fileSequence12.ts`;
+      const details1 = parseLevelPlaylist(playlist);
+      const details2 = parseLevelPlaylist(deltaUpdate1);
+      const details3 = parseLevelPlaylist(deltaUpdate2);
+      const details4 = parseLevelPlaylist(deltaUpdate3);
+
+      expect(details1, 'details1').to.include({
+        live: true,
+        canSkipUntil: 36,
+        totalduration: 60,
+        startSN: 0,
+        endSN: 9,
+        fragmentStart: 0,
+        lastPartSn: 9,
+        lastPartIndex: -1,
+        fragmentHint: undefined,
+        startCC: 0,
+        endCC: 1,
+      });
+
+      expect(details2, 'details2 before merging').to.include({
+        live: true,
+        skippedSegments: 3,
+        canSkipUntil: 36,
+        totalduration: 60,
+        startSN: 0,
+        endSN: 9,
+        lastPartSn: 9,
+        lastPartIndex: -1,
+        fragmentHint: undefined,
+        startCC: 0,
+        endCC: 0, // end CC reflects delta details until merged with previous
+      });
+      expect(details2.fragments, 'details2 parsed fragments').to.have.lengthOf(
+        10,
+      );
+
+      expect(details3, 'details3 before merging').to.include({
+        live: true,
+        skippedSegments: 3,
+        canSkipUntil: 36,
+        totalduration: 60,
+        startSN: 1,
+        endSN: 10,
+        lastPartSn: 10,
+        lastPartIndex: -1,
+        fragmentHint: undefined,
+        startCC: 0,
+        endCC: 0, // end CC reflects delta details until merged with previous
+      });
+      expect(details3.fragments, 'details3 parsed fragments').to.have.lengthOf(
+        10,
+      );
+      expect(details4, 'details4 before merging').to.include({
+        live: true,
+        skippedSegments: 3,
+        totalduration: 60,
+        startSN: 3,
+        endSN: 12,
+        lastPartSn: 12,
+        lastPartIndex: -1,
+        fragmentHint: undefined,
+        startCC: 1,
+        endCC: 2,
+      });
+      expect(details4.fragments, 'details4 parsed fragments').to.have.lengthOf(
+        10,
+      );
+
+      // This delta update had no changes from the last (same end SN)
+      details2.reloaded(details1);
+      expect(details2, 'details2 reloaded').to.include({
+        misses: 1,
+        advanced: false,
+        updated: false,
+      });
+      // discontinuity sequence numbers (frag.cc) should be carried over
+      mergeDetails(details1, details2, logger);
+      const mergedSequence1 = getFragmentSequenceNumbers(details2);
+      expect(
+        details2,
+        `details2 merged with details1 (${mergedSequence1})`,
+      ).to.include({
+        skippedSegments: 3,
+        deltaUpdateFailed: false,
+        startSN: 0,
+        endSN: 9,
+        startCC: 0,
+        endCC: 1,
+      });
+      expect(mergedSequence1).to.equal(
+        '0-0,1-0,2-1,3-1,4-1,5-1,6-1,7-1,8-1,9-1',
+      );
+      expect(details2.playlistParsingError).to.be.null;
+
+      // This delta update added and removed one segment
+      details3.reloaded(details2);
+      expect(details3, 'details3 reloaded').to.include({
+        misses: 0,
+        advanced: true,
+        updated: true,
+      });
+
+      // discontinuity sequence numbers (frag.cc) should be carried over
+      mergeDetails(details2, details3, logger);
+      const mergedSequence2 = getFragmentSequenceNumbers(details3);
+      expect(
+        details3,
+        `details3 merged with details2 (${mergedSequence2})`,
+      ).to.include({
+        skippedSegments: 3,
+        deltaUpdateFailed: false,
+        startSN: 1,
+        endSN: 10,
+        startCC: 0,
+        endCC: 1,
+      });
+      expect(mergedSequence2).to.equal(
+        '1-0,2-1,3-1,4-1,5-1,6-1,7-1,8-1,9-1,10-1',
+      );
+      expect(details3.playlistParsingError).to.be.null;
+
+      // This delta update added and removed two segments with a discontinuity at the last segment
+      details4.reloaded(details3);
+      expect(details4, 'details4 reloaded').to.include({
+        misses: 0,
+        advanced: true,
+        updated: true,
+      });
+
+      // discontinuity sequence numbers (frag.cc) should be carried over
+      mergeDetails(details3, details4, logger);
+      const mergedSequence3 = getFragmentSequenceNumbers(details4);
+      expect(
+        details4,
+        `details4 merged with details3 (${mergedSequence3})`,
+      ).to.include({
+        skippedSegments: 3,
+        deltaUpdateFailed: false,
+        startSN: 3,
+        endSN: 12,
+        startCC: 1,
+        endCC: 2,
+      });
+      expect(mergedSequence3).to.equal(
+        '3-1,4-1,5-1,6-1,7-1,8-1,9-1,10-1,11-1,12-2',
+      );
+      expect(details4.playlistParsingError).to.be.null;
+    });
+
+    it('handles delta Playlist updates with discontinuities and parts', function () {
+      const playlist = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=24,PART-HOLD-BACK=3.0
+#EXT-X-MEDIA-SEQUENCE:101
+#EXT-X-DISCONTINUITY-SEQUENCE:10
+#EXTINF:6,
+fileSequence1.m4s
+#EXT-X-DISCONTINUITY
+#EXTINF:6,
+fileSequence2.m4s
+#EXTINF:6,
+fileSequence3.m4s
+#EXTINF:6,
+fileSequence4.m4s
+#EXTINF:6,
+fileSequence5.m4s
+#EXTINF:6,
+fileSequence6.m4s
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence7.1.m4s"
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence7.2.m4s"
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence7.3.m4s"
+#EXTINF:6,
+fileSequence7.m4s
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence8.1.m4s"
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence8.2.m4s"
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence8.3.m4s"`;
+      const deltaUpdate = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=24,PART-HOLD-BACK=3.0
+#EXT-X-MEDIA-SEQUENCE:102
+#EXT-X-DISCONTINUITY-SEQUENCE:10
+#EXT-X-DISCONTINUITY
+#EXT-X-SKIP:SKIPPED-SEGMENTS=4
+#EXTINF:6,
+fileSequence6.m4s
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence7.1.m4s"
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence7.2.m4s"
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence7.3.m4s"
+#EXTINF:6,
+fileSequence7.m4s
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence8.1.m4s"
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence8.2.m4s"
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence8.3.m4s"
+#EXTINF:6,
+fileSequence8.m4s
+#EXT-X-DISCONTINUITY
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence9.1.m4s"`;
+      const deltaUpdateIncrementDisco = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=24,PART-HOLD-BACK=3.0
+#EXT-X-MEDIA-SEQUENCE:102
+#EXT-X-DISCONTINUITY-SEQUENCE:11
+#EXT-X-SKIP:SKIPPED-SEGMENTS=4
+#EXTINF:6,
+fileSequence6.m4s
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence7.1.m4s"
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence7.2.m4s"
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence7.3.m4s"
+#EXTINF:6,
+fileSequence7.m4s
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence8.1.m4s"
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence8.2.m4s"
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence8.3.m4s"
+#EXTINF:6,
+fileSequence8.m4s
+#EXT-X-DISCONTINUITY
+#EXT-X-PART:DURATION=2,URI="ll.m4s?segment=fileSequence9.1.m4s"`;
+      const details1 = parseLevelPlaylist(playlist);
+      const details2 = parseLevelPlaylist(deltaUpdate);
+      const details3 = parseLevelPlaylist(deltaUpdateIncrementDisco);
+      expect(details1, 'details1').to.include({
+        live: true,
+        canSkipUntil: 24,
+        totalduration: 48,
+        startSN: 101,
+        endSN: 107,
+        fragmentStart: 0,
+        lastPartSn: 108,
+        lastPartIndex: 2,
+        startCC: 10,
+        endCC: 11,
+      });
+
+      expect(
+        details2,
+        'delta w/o disco seq incremented before merging',
+      ).to.include({
+        live: true,
+        skippedSegments: 4,
+        canSkipUntil: 24,
+        totalduration: 44,
+        startSN: 102,
+        endSN: 108,
+        lastPartSn: 109,
+        lastPartIndex: 0,
+        startCC: 10,
+        endCC: 12,
+      });
+      expect(
+        details2.fragments,
+        'delta w/o disco seq incremented fragments',
+      ).to.have.lengthOf(7);
+
+      expect(
+        details3,
+        'delta w/ disco seq incremented before merging',
+      ).to.include({
+        live: true,
+        skippedSegments: 4,
+        canSkipUntil: 24,
+        totalduration: 44,
+        startSN: 102,
+        endSN: 108,
+        lastPartSn: 109,
+        lastPartIndex: 0,
+        startCC: 11, // w/ disco-sequence incremented
+        endCC: 12, // end CC reflects delta details until merged with previous
+      });
+      expect(
+        details3.fragments,
+        'delta w/ disco seq incremented fragments',
+      ).to.have.lengthOf(7);
+
+      // This delta update does not increment discontinuity-sequence (discontinuity tag would appear before first segment)
+      details2.reloaded(details1);
+      expect(details2, 'delta w/o disco seq incremented reloaded').to.include({
+        misses: 0,
+        advanced: true,
+        updated: true,
+      });
+      // discontinuity sequence numbers (frag.cc) should be carried over
+      mergeDetails(details1, details2, logger);
+      const mergedSequence1 = getFragmentSequenceNumbers(details2);
+      expect(
+        details2,
+        `delta w/o disco seq incremented merged (${mergedSequence1})`,
+      ).to.include({
+        skippedSegments: 4,
+        deltaUpdateFailed: false,
+        startSN: 102,
+        endSN: 108,
+        startCC: 10, // w/o disco-sequence incremented
+        endCC: 11,
+      });
+      expect(details2.fragments[0]).to.include({ sn: 102, cc: 11 });
+      expect(details2.fragmentHint).to.include({ sn: 109, cc: 12 });
+      expect(mergedSequence1).to.equal(
+        '102-11,103-11,104-11,105-11,106-11,107-11,108-11',
+      );
+      expect(details2.playlistParsingError).to.be.null;
+
+      // This delta update does not increment discontinuity-sequence (discontinuity tag would appear before first segment)
+      details3.reloaded(details1);
+      expect(details3, 'delta w/ disco seq incremented reloaded').to.include({
+        misses: 0,
+        advanced: true,
+        updated: true,
+      });
+      // discontinuity sequence numbers (frag.cc) should be carried over
+      mergeDetails(details1, details3, logger);
+      const mergedSequence2 = getFragmentSequenceNumbers(details3);
+      expect(
+        details3,
+        `delta w/ disco seq incremented merged (${mergedSequence2})`,
+      ).to.include({
+        skippedSegments: 4,
+        deltaUpdateFailed: false,
+        startSN: 102,
+        endSN: 108,
+        startCC: 11, // w/ disco-sequence incremented
+        endCC: 11,
+      });
+      expect(details3.fragments[0]).to.include({ sn: 102, cc: 11 });
+      expect(details3.fragmentHint).to.include({ sn: 109, cc: 12 });
+      expect(mergedSequence2).to.equal(
+        '102-11,103-11,104-11,105-11,106-11,107-11,108-11',
+      );
+      expect(details3.playlistParsingError).to.be.null;
+    });
+
+    it('handles delta Playlist updates with discontinuities and parts and no sequence change (missing PDT)', function () {
+      const playlist = `#EXTM3U
+#EXT-X-VERSION:10
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-TARGETDURATION:3
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=3.126000,CAN-SKIP-UNTIL=20.0
+#EXT-X-PART-INF:PART-TARGET=1.000000
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-DISCONTINUITY-SEQUENCE:0
+#EXT-X-DATERANGE:ID="nmss-daterange",START-DATE="2025-05-22T07:59:38.809Z"
+
+#EXT-X-MAP:URI="720p_0_0.m4s"
+#EXTINF:2.500000,
+720p_0.m4v
+#EXTINF:2.500000,
+720p_1.m4v
+#EXTINF:2.500000,
+720p_2.m4v
+#EXTINF:2.184667,
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="720p_0_1.m4s
+#EXTINF:2.500000,
+720p_3.m4v 
+#EXTINF:2.500000,
+720p_4.m4v
+#EXTINF:2.500000,
+720p_5.m4v
+#EXTINF:2.500000,
+720p_6.m4v
+#EXTINF:2.500000,
+720p_7.m4v
+#EXTINF:2.500000,
+720p_8.m4v
+#EXT-X-PART:DURATION=1.000000,URI="720p_9_0.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.000000,URI="720p_9_1.m4v"
+#EXT-X-PART:DURATION=0.500000,URI="720p_9_2.m4v"
+#EXTINF:2.500000,
+720p_9.m4v
+#EXT-X-PART:DURATION=1.000000,URI="720p_10_0.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.000000,URI="720p_10_1.m4v"
+#EXT-X-PART:DURATION=0.500000,URI="720p_10_2.m4v"
+#EXTINF:2.500000,
+720p_10.m4v
+#EXT-X-PART:DURATION=1.000000,URI="720p_11_0.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.000000,URI="720p_11_1.m4v"
+#EXT-X-PART:DURATION=0.500000,URI="720p_11_2.m4v"
+#EXTINF:2.500000,
+720p_11.m4v
+#EXT-X-PART:DURATION=1.000000,URI="720p_12_0.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.000000,URI="720p_12_0.m4v"
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI="720p_12_2.m4v"`;
+      const deltaUpdate = `#EXTM3U
+#EXT-X-VERSION:10
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-TARGETDURATION:3
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=3.126000,CAN-SKIP-UNTIL=20.0
+#EXT-X-PART-INF:PART-TARGET=1.000000
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-DISCONTINUITY-SEQUENCE:0
+#EXT-X-DATERANGE:ID="nmss-daterange",START-DATE="2025-05-22T07:59:38.809Z"
+#EXT-X-SKIP:SKIPPED-SEGMENTS=4
+
+#EXT-X-MAP:URI="720p_0_1.m4s"
+720p_4.m4v
+#EXTINF:2.500000,
+720p_5.m4v
+#EXTINF:2.500000,
+720p_6.m4v
+#EXTINF:2.500000,
+720p_7.m4v
+#EXTINF:2.500000,
+720p_8.m4v
+#EXT-X-PART:DURATION=1.000000,URI="720p_9_0.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.000000,URI="720p_9_1.m4v"
+#EXT-X-PART:DURATION=0.500000,URI="720p_9_2.m4v"
+#EXTINF:2.500000,
+720p_9.m4v
+#EXT-X-PART:DURATION=1.000000,URI="720p_10_0.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.000000,URI="720p_10_1.m4v"
+#EXT-X-PART:DURATION=0.500000,URI="720p_10_2.m4v"
+#EXTINF:2.500000,
+720p_10.m4v
+#EXT-X-PART:DURATION=1.000000,URI="720p_11_0.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.000000,URI="720p_11_1.m4v"
+#EXT-X-PART:DURATION=0.500000,URI="720p_11_2.m4v"
+#EXTINF:2.500000,
+720p_11.m4v
+#EXT-X-PART:DURATION=1.000000,URI="720p_12_0.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.000000,URI="720p_12_0.m4v"
+#EXT-X-PART:DURATION=1.000000,URI="720p_12_0.m4v"
+#EXTINF:2.500000,
+720p_12.m4v
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI="720p_13_0.m4`;
+
+      const details1 = parseLevelPlaylist(playlist);
+      const details2 = parseLevelPlaylist(deltaUpdate);
+      expect(details1, 'details1').to.include({
+        live: true,
+        canSkipUntil: 20,
+        totalduration: 32,
+        startSN: 0,
+        endSN: 11,
+        fragmentStart: 0,
+        lastPartSn: 12,
+        lastPartIndex: 1,
+        startCC: 0,
+        endCC: 1,
+      });
+
+      expect(
+        details2,
+        'delta w/o disco seq incremented before merging',
+      ).to.include({
+        live: true,
+        skippedSegments: 4,
+        canSkipUntil: 20,
+        totalduration: 32,
+        startSN: 0,
+        endSN: 12,
+        lastPartSn: 12,
+        lastPartIndex: 2,
+        startCC: 0,
+        endCC: 0, // endCC of delta playlist will not be incremented until merged
+      });
+      expect(
+        details2.fragments,
+        'delta w/o disco seq incremented fragments',
+      ).to.have.lengthOf(13);
+
+      // This delta update does not increment discontinuity-sequence (discontinuity tag would appear before first segment)
+      details2.reloaded(details1);
+      expect(details2, 'delta w/o disco seq incremented reloaded').to.include({
+        misses: 0,
+        advanced: true,
+        updated: true,
+      });
+      // discontinuity sequence numbers (frag.cc) should be carried over
+      mergeDetails(details1, details2, logger);
+      const mergedSequence1 = getFragmentSequenceNumbers(details2);
+      expect(
+        details2,
+        `delta w/o disco seq incremented merged (${mergedSequence1})`,
+      ).to.include({
+        skippedSegments: 4,
+        deltaUpdateFailed: false,
+        startSN: 0,
+        endSN: 12,
+        startCC: 0,
+        endCC: 1, // incremented after merging
+      });
+      expect(details2.fragmentHint).to.include({ sn: 13, cc: 1 });
+      expect(mergedSequence1).to.equal(
+        '0-0,1-0,2-0,3-1,4-1,5-1,6-1,7-1,8-1,9-1,10-1,11-1,12-1',
+      );
+      expect(details2.playlistParsingError).to.be.null;
+    });
+
+    it('handles delta Playlist updates with multiple skip tags and removed date ranges', function () {
+      const playlist = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:10
+#EXT-X-MEDIA-SEQUENCE:3
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36.0,CAN-SKIP-DATERANGES=YES,CAN-BLOCK-RELOAD=YES,HOLDBACK=18,PART-HOLDBACK=3
+#EXT-X-PROGRAM-DATE-TIME:2019-04-29T19:52:19.060Z
+#EXT-X-DATERANGE:ID="d0",START-DATE="2019-04-29T19:52:20.000Z",DURATION=0
+#EXT-X-DATERANGE:ID="d1",START-DATE="2019-04-29T19:52:21.000Z",DURATION=1
+#EXT-X-DATERANGE:ID="d2",START-DATE="2019-04-29T19:52:22.000Z",DURATION=2
+#EXT-X-DATERANGE:ID="d3",START-DATE="2019-04-29T19:52:23.000Z",DURATION=3
+#EXT-X-DATERANGE:ID="d4",START-DATE="2019-04-29T19:52:24.000Z",DURATION=4
+#EXTINF:6,
+fileSequence3.ts
+#EXTINF:6,
+fileSequence4.ts
+#EXTINF:6,
+fileSequence5.ts
+#EXTINF:6,
+fileSequence6.ts
+#EXTINF:6,
+fileSequence7.ts
+#EXTINF:6,
+fileSequence8.ts
+#EXTINF:6,
+fileSequence9.ts
+#EXTINF:6,
+fileSequence10.ts
+#EXTINF:6,
+fileSequence11.ts
+#EXTINF:6,
+fileSequence12.ts
+#EXTINF:6,
+fileSequence13.ts
+#EXTINF:6,
+fileSequence14.ts
+#EXTINF:6,
+fileSequence15.ts
+#EXTINF:6,
+fileSequence16.ts
+#EXTINF:6,
+fileSequence17.ts`;
+      const playlistUpdate = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:10
+#EXT-X-MEDIA-SEQUENCE:3
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36.0,CAN-SKIP-DATERANGES=YES,CAN-BLOCK-RELOAD=YES,HOLDBACK=18,PART-HOLDBACK=3
+#EXT-X-DATERANGE:ID="d3",START-DATE="2019-04-29T19:52:23.000Z",DURATION=3
+#EXT-X-DATERANGE:ID="d5",START-DATE="2019-04-29T19:52:25.000Z",DURATION=5
+#EXT-X-DATERANGE:ID="d6",START-DATE="2019-04-29T19:52:26.000Z",DURATION=6
+#EXT-X-SKIP:SKIPPED-SEGMENTS=2,RECENTLY-REMOVED-DATERANGES="d1	d4"
+#EXTINF:6,
+fileSequence5.ts
+#EXTINF:6,
+fileSequence6.ts
+#EXT-X-SKIP:SKIPPED-SEGMENTS=2,RECENTLY-REMOVED-DATERANGES="d0"
+#EXTINF:6,
+fileSequence9.ts
+#EXTINF:6,
+fileSequence10.ts
+#EXTINF:6,
+fileSequence11.ts
+#EXTINF:6,
+fileSequence12.ts
+#EXTINF:6,
+fileSequence13.ts
+#EXTINF:6,
+fileSequence14.ts
+#EXTINF:6,
+fileSequence15.ts
+#EXTINF:6,
+fileSequence16.ts
+#EXTINF:6,
+fileSequence17.ts
+#EXTINF:6,
+fileSequence18.ts`;
+      const details = parseLevelPlaylist(playlist);
+      const detailsUpdated = parseLevelPlaylist(playlistUpdate);
+      mergeDetails(details, detailsUpdated, logger);
+      expect(details.hasProgramDateTime, 'details.hasProgramDateTime').to.be
+        .true;
+      expect(
+        Object.keys(details.dateRanges),
+        'first playlist daterange ids',
+      ).to.have.deep.equal(['d0', 'd1', 'd2', 'd3', 'd4']);
+      expect(details.dateRanges.d2!.startTime).to.equal(2.94);
+      expect(details.dateRanges.d3!.startTime).to.equal(3.94);
+      expect(
+        detailsUpdated.hasProgramDateTime,
+        'detailsUpdated.hasProgramDateTime',
+      ).to.be.true;
+      expect(
+        detailsUpdated.recentlyRemovedDateranges,
+        'removed daterange ids',
+      ).to.deep.equal(['d1', 'd4', 'd0']);
+      expect(
+        Object.keys(detailsUpdated.dateRanges),
+        'delta playlist merged daterange ids',
+      ).to.have.deep.equal(['d2', 'd3', 'd5', 'd6']);
+      expect(detailsUpdated.dateRanges, 'd2 updated')
+        .to.have.property('d2')
+        .which.has.property('tagAnchor')
+        .which.equals(detailsUpdated.fragments[0].ref)
+        .which.has.property('sn')
+        .which.equals(3);
+      expect(detailsUpdated.dateRanges.d2!.startTime).to.equal(2.94);
+      expect(detailsUpdated.dateRanges.d3!.startTime).to.equal(3.94);
+      // Multiple #EXT-X-SKIP tags are not allowed
+      expect(detailsUpdated.playlistParsingError).to.include({
+        message: `#EXT-X-SKIP must not appear more than once (#EXT-X-SKIP:SKIPPED-SEGMENTS=2,RECENTLY-REMOVED-DATERANGES="d0")`,
+      });
+    });
+
+    it('handles delta Playlist updates when EXT-X-SKIP is declared before EXT-X-MEDIA-SEQUENCE', function () {
+      const playlist = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36
+#EXT-X-MEDIA-SEQUENCE:100
+#EXTINF:6,
+fileSequence100.ts
+#EXTINF:6,
+fileSequence101.ts
+#EXTINF:6,
+fileSequence102.ts
+#EXTINF:6,
+fileSequence103.ts
+#EXTINF:6,
+fileSequence104.ts
+#EXTINF:6,
+fileSequence105.ts
+#EXTINF:6,
+fileSequence106.ts
+#EXTINF:6,
+fileSequence107.ts
+#EXTINF:6,
+fileSequence108.ts
+#EXTINF:6,
+fileSequence109.ts`;
+      const deltaUpdate1 = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36
+#EXT-X-SKIP:SKIPPED-SEGMENTS=3
+#EXT-X-MEDIA-SEQUENCE:100
+#EXTINF:6,
+fileSequence103.ts
+#EXTINF:6,
+fileSequence104.ts
+#EXTINF:6,
+fileSequence105.ts
+#EXTINF:6,
+fileSequence106.ts
+#EXTINF:6,
+fileSequence107.ts
+#EXTINF:6,
+fileSequence108.ts
+#EXTINF:6,
+fileSequence109.ts
+#EXTINF:6,
+fileSequence110.ts`;
+      const deltaUpdate2 = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36
+#EXT-X-SKIP:SKIPPED-SEGMENTS=3
+#EXT-X-MEDIA-SEQUENCE:102
+#EXTINF:6,
+fileSequence105.ts
+#EXTINF:6,
+fileSequence106.ts
+#EXTINF:6,
+fileSequence107.ts
+#EXTINF:6,
+fileSequence108.ts
+#EXTINF:6,
+fileSequence109.ts
+#EXTINF:6,
+fileSequence110.ts
+#EXTINF:6,
+fileSequence111.ts
+#EXTINF:6,
+fileSequence112.ts`;
+      const details1 = parseLevelPlaylist(playlist);
+      const details2 = parseLevelPlaylist(deltaUpdate1);
+      const details3 = parseLevelPlaylist(deltaUpdate2);
+
+      expect(details2.playlistParsingError, 'details2 parsing error').to.be
+        .null;
+      expect(details2, 'details2 before merging').to.include({
+        live: true,
+        skippedSegments: 3,
+        startSN: 100,
+        endSN: 110,
+      });
+      expect(details2.fragments, 'details2 parsed fragments').to.have.lengthOf(
+        11,
+      );
+      expect(details2.fragments[0]).to.equal(null);
+      expect(details2.fragments[2]).to.equal(null);
+      expect(details2.fragments[3]?.sn).to.equal(103);
+
+      mergeDetails(details1, details2, logger);
+      expect(details2, 'details2 merged with details1').to.include({
+        deltaUpdateFailed: false,
+        startSN: 100,
+        endSN: 110,
+      });
+      expect(details2.playlistParsingError).to.be.null;
+      details2.fragments.forEach((frag, i) => {
+        expect(frag, `details2.fragments[${i}]`).to.not.equal(null);
+        expect(frag.sn, `details2.fragments[${i}].sn`).to.equal(100 + i);
+        expect(frag.relurl, `details2.fragments[${i}].relurl`).to.equal(
+          `fileSequence${100 + i}.ts`,
+        );
+      });
+
+      mergeDetails(details2, details3, logger);
+      expect(details3, 'details3 merged with details2').to.include({
+        deltaUpdateFailed: false,
+        startSN: 102,
+        endSN: 112,
+      });
+      expect(details3.playlistParsingError).to.be.null;
+      details3.fragments.forEach((frag, i) => {
+        expect(frag, `details3.fragments[${i}]`).to.not.equal(null);
+        expect(frag.sn, `details3.fragments[${i}].sn`).to.equal(102 + i);
+        expect(frag.relurl, `details3.fragments[${i}].relurl`).to.equal(
+          `fileSequence${102 + i}.ts`,
+        );
+      });
+    });
+
+    it('detects media sequence mismatch on delta updates when EXT-X-SKIP is declared before EXT-X-MEDIA-SEQUENCE', function () {
+      const playlist = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36
+#EXT-X-MEDIA-SEQUENCE:100
+#EXTINF:6,
+fileSequence100.ts
+#EXTINF:6,
+fileSequence101.ts
+#EXTINF:6,
+fileSequence102.ts
+#EXTINF:6,
+fileSequence103.ts
+#EXTINF:6,
+fileSequence104.ts
+#EXTINF:6,
+fileSequence105.ts`;
+      // The sequence numbering of this delta update does not match the
+      // previous playlist (fileSequence104 was at 104, now at 105)
+      const deltaUpdate = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36
+#EXT-X-SKIP:SKIPPED-SEGMENTS=3
+#EXT-X-MEDIA-SEQUENCE:102
+#EXTINF:6,
+fileSequence104.ts
+#EXTINF:6,
+fileSequence105.ts
+#EXTINF:6,
+fileSequence106.ts`;
+      const details1 = parseLevelPlaylist(playlist);
+      const details2 = parseLevelPlaylist(deltaUpdate);
+
+      expect(details2.playlistParsingError, 'details2 parsing error').to.be
+        .null;
+      mergeDetails(details1, details2, logger);
+      expect(details2.playlistParsingError?.message).to.match(
+        /^media sequence mismatch 105:/,
+      );
+    });
+
+    it('does not add more sliding when LevelDetails arguments are the same object', function () {
+      const playlist = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:10
+#EXT-X-MEDIA-SEQUENCE:3
+#EXTINF:6,
+fileSequence5.ts
+#EXTINF:6,
+fileSequence6.ts`;
+      const details = parseLevelPlaylist(playlist);
+      addSliding(details, 10);
+      expect(details.fragmentStart).to.equal(10);
+      mergeDetails(details, details, logger);
+      expect(details.fragmentStart).to.equal(10);
+    });
+
+    it('aligns discontinuities based on media sequence number', function () {
+      const playlist1 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:26
+#EXT-X-MAP:URI="video_init.mp4"
+#EXTINF:2.000,
+video_26.m4s
+#EXT-X-DISCONTINUITY
+#EXTINF:2.000,
+video_27.m4s
+#EXT-X-DISCONTINUITY
+#EXTINF:2.000,
+video_28.m4s
+#EXT-X-DISCONTINUITY
+#EXTINF:2.000,
+video_29.m4s
+#EXTINF:2.000,
+video_30.m4s
+#EXT-X-DISCONTINUITY
+#EXTINF:2.000,
+video_31.m4s`;
+      const playlist2 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:28
+#EXT-X-MAP:URI="video_init.mp4"
+#EXTINF:2.000,
+video_28.m4s
+#EXT-X-DISCONTINUITY
+#EXTINF:2.000,
+video_29.m4s
+#EXTINF:2.000,
+video_30.m4s
+#EXT-X-DISCONTINUITY
+#EXTINF:2.000,
+video_31.m4s
+#EXT-X-DISCONTINUITY
+#EXTINF:2.000,
+video_32.m4s`;
+      const oldPlaylist = parseLevelPlaylist(playlist1);
+      const newPlaylist = parseLevelPlaylist(playlist2);
+
+      expect(oldPlaylist).to.include({
+        startSN: 26,
+        startCC: 0,
+        endCC: 4,
+      });
+      expect(newPlaylist).to.include({
+        startSN: 28,
+        startCC: 0,
+        endCC: 3,
+      });
+
+      mergeDetails(oldPlaylist, newPlaylist, logger);
+
+      expect(newPlaylist.playlistParsingError).to.be.null;
+      expect(newPlaylist).to.include({
+        startSN: 28,
+        startCC: 1,
+        endCC: 5,
+      });
+
+      const mergedSequence = getFragmentSequenceNumbers(newPlaylist);
+      expect(mergedSequence).to.equal('28-2,29-3,30-3,31-4,32-5');
+    });
+
+    it('aligns discontinuities based on media sequence number (#7163)', function () {
+      const playlist1 = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="getMP4InitFragment.mp4"
+#EXT-X-PROGRAM-DATE-TIME:2025-04-08T14:20:25.166Z
+#EXTINF:1.875,
+getMP4MediaFragment.mp4?FragmentNumber=91343852333398821492057832144523283530704043374
+#EXT-X-DISCONTINUITY
+#EXT-X-PROGRAM-DATE-TIME:2025-04-08T14:20:27.155Z
+#EXTINF:1.73,
+getMP4MediaFragment.mp4?FragmentNumber=91343852333398821497009592301664805164162363767
+#EXT-X-DISCONTINUITY
+#EXT-X-PROGRAM-DATE-TIME:2025-04-08T14:20:28.696Z
+#EXTINF:1.698,
+getMP4MediaFragment.mp4?FragmentNumber=91343852333398821501961352458806326677392019605
+#EXT-X-DISCONTINUITY
+#EXT-X-PROGRAM-DATE-TIME:2025-04-08T14:20:30.387Z
+#EXTINF:1.742,
+getMP4MediaFragment.mp4?FragmentNumber=91343852333398821506913112615947848230969811191
+#EXT-X-DISCONTINUITY
+#EXT-X-PROGRAM-DATE-TIME:2025-04-08T14:20:32.335Z
+#EXTINF:1.685,
+getMP4MediaFragment.mp4?FragmentNumber=91343852333398821511864872773089369853347903342`;
+      const playlist2 = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:1
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="getMP4InitFragment.mp4"
+#EXT-X-PROGRAM-DATE-TIME:2025-04-08T14:20:27.155Z
+#EXTINF:1.73,
+getMP4MediaFragment.mp4?FragmentNumber=91343852333398821497009592301664805164162363767
+#EXT-X-DISCONTINUITY
+#EXT-X-PROGRAM-DATE-TIME:2025-04-08T14:20:28.696Z
+#EXTINF:1.698,
+getMP4MediaFragment.mp4?FragmentNumber=91343852333398821501961352458806326677392019605
+#EXT-X-DISCONTINUITY
+#EXT-X-PROGRAM-DATE-TIME:2025-04-08T14:20:30.387Z
+#EXTINF:1.742,
+getMP4MediaFragment.mp4?FragmentNumber=91343852333398821506913112615947848230969811191
+#EXT-X-DISCONTINUITY
+#EXT-X-PROGRAM-DATE-TIME:2025-04-08T14:20:32.335Z
+#EXTINF:1.685,
+getMP4MediaFragment.mp4?FragmentNumber=91343852333398821511864872773089369853347903342
+#EXT-X-DISCONTINUITY
+#EXT-X-PROGRAM-DATE-TIME:2025-04-08T14:20:33.806Z
+#EXTINF:1.677,
+getMP4MediaFragment.mp4?FragmentNumber=91343852333398821516816632930230891347979802607`;
+      const oldPlaylist = parseLevelPlaylist(playlist1);
+      const newPlaylist = parseLevelPlaylist(playlist2);
+
+      expect(oldPlaylist).to.include({
+        startSN: 0,
+        startCC: 0,
+        endCC: 5,
+      });
+      expect(newPlaylist).to.include({
+        startSN: 1,
+        startCC: 0,
+        endCC: 5,
+      });
+
+      mergeDetails(oldPlaylist, newPlaylist, logger);
+
+      expect(newPlaylist.playlistParsingError).to.be.null;
+      expect(newPlaylist).to.include({
+        startSN: 1,
+        startCC: 1,
+        endCC: 6,
+      });
+
+      const mergedSequence = getFragmentSequenceNumbers(newPlaylist);
+      expect(mergedSequence).to.equal('1-2,2-3,3-4,4-5,5-6');
+    });
+  });
+
+  describe('computeReloadInterval', function () {
+    let sandbox;
+    beforeEach(function () {
+      sandbox = sinon.createSandbox();
+      sandbox.stub(performance, 'now').returns(0);
+    });
+
+    afterEach(function () {
+      sandbox.restore();
+    });
+
+    it('returns the targetduration of the new level if available', function () {
+      const newPlaylist = generatePlaylist([3, 4], 0, 6);
+      newPlaylist.targetduration = 5;
+      newPlaylist.updated = true;
+      const actual = computeReloadInterval(newPlaylist);
+      expect(actual).to.equal(5000);
+    });
+
+    it('halves the reload interval if the playlist contains the same segments', function () {
+      const newPlaylist = generatePlaylist([1, 2]);
+      newPlaylist.updated = false;
+      newPlaylist.targetduration = 5;
+      const actual = computeReloadInterval(newPlaylist);
+      expect(actual).to.equal(2500);
+    });
+
+    it('rounds the reload interval', function () {
+      const newPlaylist = generatePlaylist([3, 4], 0, 10);
+      newPlaylist.targetduration = 5.9999;
+      newPlaylist.updated = true;
+      const actual = computeReloadInterval(newPlaylist);
+      expect(actual).to.equal(6000);
+    });
+
+    it('returns a minimum of half the target duration', function () {
+      const newPlaylist = generatePlaylist([3, 4]);
+      newPlaylist.targetduration = 5;
+      newPlaylist.updated = false;
+      const actual = computeReloadInterval(newPlaylist);
+      expect(actual).to.equal(2500);
+    });
+
+    it('returns the last fragment duration when distance to live edge is less than or equal to four target durations', function () {
+      const newPlaylist = generatePlaylist([3, 4], 0, 2);
+      newPlaylist.targetduration = 5;
+      newPlaylist.updated = true;
+      const actual = computeReloadInterval(newPlaylist, 20000);
+      expect(actual).to.equal(5000);
+      const actualLow = computeReloadInterval(newPlaylist, 14000);
+      expect(actualLow).to.equal(2000);
+    });
+  });
+
+  describe('main and alternate playlist alignment on live update with discontinuity', function () {
+    const mainPlaylist_01 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:3
+#EXT-X-MEDIA-SEQUENCE:5428
+#EXT-X-DISCONTINUITY-SEQUENCE:31
+#EXT-X-PROGRAM-DATE-TIME:2024-11-20T14:14:59.000Z
+#EXT-X-MAP:URI="video_init.mp4"
+#EXTINF:2.000,
+video_5428.m4s
+#EXTINF:2.000,
+video_5429.m4s
+#EXTINF:2.000,
+video_5430.m4s
+#EXTINF:2.000,
+video_5431.m4s
+#EXTINF:2.000,
+video_5432.m4s
+#EXTINF:2.000,
+video_5433.m4s
+#EXTINF:2.000,
+video_5434.m4s`;
+
+    const mainPlaylist_02 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:3
+#EXT-X-MEDIA-SEQUENCE:5438
+#EXT-X-DISCONTINUITY-SEQUENCE:31
+#EXT-X-PROGRAM-DATE-TIME:2024-11-20T14:15:53.000Z
+#EXT-X-MAP:URI="video_init.mp4"
+#EXT-X-DISCONTINUITY
+#EXTINF:2.033,
+video_5438.m4s
+#EXTINF:2.000,
+video_5439.m4s
+#EXTINF:2.000,
+video_5440.m4s
+#EXTINF:2.000,
+video_5441.m4s`;
+
+    const audioPlaylist_01 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:3
+#EXT-X-MEDIA-SEQUENCE:5428
+#EXT-X-DISCONTINUITY-SEQUENCE:31
+#EXT-X-PROGRAM-DATE-TIME:2024-11-20T14:14:58.500Z
+#EXT-X-MAP:URI="audio_init.mp4"
+#EXTINF:2.005,
+audio_5428.m4s
+#EXTINF:2.005,
+audio_5429.m4s
+#EXTINF:2.005,
+audio_5430.m4s
+#EXTINF:1.984,
+audio_5431.m4s
+#EXTINF:2.005,
+audio_5432.m4s
+#EXTINF:2.005,
+audio_5433.m4s
+#EXTINF:2.005,
+audio_5434.m4s
+#EXTINF:2.005,
+audio_5435.m4s`;
+
+    const audioPlaylist_02 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:3
+#EXT-X-MEDIA-SEQUENCE:5438
+#EXT-X-DISCONTINUITY-SEQUENCE:31
+#EXT-X-PROGRAM-DATE-TIME:2024-11-20T14:15:52.500Z
+#EXT-X-MAP:URI="audio_init.mp4"
+#EXT-X-DISCONTINUITY
+#EXTINF:0.619,
+audio_5438.m4s
+#EXTINF:1.984,
+audio_5439.m4s
+#EXTINF:2.005,
+audio_5440.m4s
+#EXTINF:2.005,
+audio_5441.m4s`;
+
+    let hls: HlsTestable;
+    let levelInfo: Level;
+    let trackInfo: MediaPlaylist;
+    let mainDetails1: LevelDetails;
+    let mainDetails2: LevelDetails;
+    let audioDetails1: LevelDetails;
+    let audioDetails2: LevelDetails;
+
+    beforeEach(function () {
+      hls = new Hls({
+        // debug: true,
+      }) as unknown as HlsTestable;
+      for (let i = hls.networkControllers.length; i--; ) {
+        const component = hls.networkControllers[i];
+        if (
+          component !== (hls as any).streamController &&
+          !(component instanceof AudioStreamController)
+        ) {
+          component.destroy();
+          hls.networkControllers.splice(i, 1);
+        }
+      }
+      hls.coreComponents.forEach(
+        (component) =>
+          component !== (hls as any).latencyController && component.destroy(),
+      );
+      hls.coreComponents.length = 0;
+
+      mainDetails1 = parseLevelPlaylist(
+        mainPlaylist_01,
+        'http://example.com/playlist-v.m3u8',
+      );
+      mainDetails2 = parseLevelPlaylist(
+        mainPlaylist_02,
+        'http://example.com/playlist-v.m3u8',
+      );
+      audioDetails1 = parseLevelPlaylist(
+        audioPlaylist_01,
+        'http://example.com/playlist-a.m3u8',
+        PlaylistLevelType.AUDIO,
+      );
+      audioDetails2 = parseLevelPlaylist(
+        audioPlaylist_02,
+        'http://example.com/playlist-a.m3u8',
+        PlaylistLevelType.AUDIO,
+      );
+
+      levelInfo = new Level({
+        attrs: new AttrList({}),
+        bitrate: 0,
+        details: mainDetails1,
+        name: '',
+        url: '',
+      });
+      trackInfo = {
+        attrs: new AttrList({}) as MediaAttributes,
+        autoselect: true,
+        bitrate: 0,
+        default: true,
+        forced: false,
+        groupId: '',
+        id: 0,
+        name: '',
+        type: 'AUDIO' as AudioPlaylistType,
+        url: '',
+      };
+
+      hls.trigger(Events.MANIFEST_PARSED, {
+        levels: [levelInfo],
+        audioTracks: [trackInfo],
+        iframeVariants: [],
+        subtitleTracks: [],
+        sessionData: null,
+        sessionKeys: null,
+        firstLevel: 0,
+        stats: new LoadStats(),
+        audio: true,
+        video: true,
+        altAudio: true,
+      });
+      hls.trigger(Events.AUDIO_TRACKS_UPDATED, { audioTracks: [trackInfo] });
+    });
+
+    afterEach(function () {
+      hls.destroy();
+    });
+
+    function levelLoaded(details: LevelDetails, levelInfo: Level) {
+      hls.trigger(Events.LEVEL_LOADED, {
+        details,
+        levelInfo,
+        level: 0,
+        id: 0,
+        stats: new LoadStats(),
+        networkDetails: new Response('ok'),
+        deliveryDirectives: null,
+      });
+    }
+
+    function audioTrackLoaded(details: LevelDetails, track: MediaPlaylist) {
+      hls.trigger(Events.AUDIO_TRACK_LOADED, {
+        details,
+        track,
+        id: 0,
+        groupId: '',
+        stats: new LoadStats(),
+        networkDetails: new Response('ok'),
+        deliveryDirectives: null,
+      });
+    }
+
+    it('aligns playlist on level update', function () {
+      // First main and audio playlist responses
+      levelLoaded(mainDetails1, levelInfo);
+      audioTrackLoaded(audioDetails1, trackInfo);
+
+      expect(mainDetails1.fragmentStart).to.equal(0);
+      expect(audioDetails1.fragmentStart).to.equal(-0.5);
+      expect(mainDetails1.totalduration).to.equal(14);
+      expect(audioDetails1.totalduration).to.equal(16.019);
+
+      // Seconds main and audio playlist responses
+      mergeDetails(mainDetails1, mainDetails2, logger);
+      mergeDetails(audioDetails1, audioDetails2, logger);
+      expect(audioDetails2.alignedSliding).to.be.false;
+      expect(mainDetails2.fragmentStart).to.equal(20.0825);
+      expect(audioDetails2.fragmentStart).to.equal(16.0325);
+
+      expect(mainDetails2.startCC).to.equal(31);
+      expect(audioDetails2.startCC).to.equal(31);
+      expect(mainDetails2.endCC).to.equal(32);
+      expect(audioDetails2.endCC).to.equal(32);
+
+      levelLoaded(mainDetails2, levelInfo);
+      audioTrackLoaded(audioDetails2, trackInfo);
+
+      expect(audioDetails2.alignedSliding).to.be.true;
+      expect(mainDetails2.fragmentStart).to.equal(20.0825);
+      expect(audioDetails2.fragmentStart).to.equal(20.0825);
+
+      expect(mainDetails2.playlistParsingError).to.be.null;
+      expect(audioDetails2.playlistParsingError).to.be.null;
+    });
+
+    it('aligns playlist on track update', function () {
+      // First main and audio playlist responses
+      audioTrackLoaded(audioDetails1, trackInfo);
+      levelLoaded(mainDetails1, levelInfo);
+
+      expect(mainDetails1.fragmentStart).to.equal(0);
+      expect(audioDetails1.fragmentStart).to.equal(-0.5);
+      expect(mainDetails1.totalduration).to.equal(14);
+      expect(audioDetails1.totalduration).to.equal(16.019);
+
+      // Seconds main and audio playlist responses
+      mergeDetails(mainDetails1, mainDetails2, logger);
+      mergeDetails(audioDetails1, audioDetails2, logger);
+      expect(audioDetails2.alignedSliding).to.be.false;
+      expect(mainDetails2.fragmentStart).to.equal(20.0825);
+      expect(audioDetails2.fragmentStart).to.equal(16.0325);
+
+      audioTrackLoaded(audioDetails2, trackInfo);
+      levelLoaded(mainDetails2, levelInfo);
+
+      expect(audioDetails2.alignedSliding).to.be.true;
+      expect(mainDetails2.fragmentStart).to.equal(20.0825);
+      expect(audioDetails2.fragmentStart).to.equal(20.0825);
+
+      expect(mainDetails2.playlistParsingError).to.be.null;
+      expect(audioDetails2.playlistParsingError).to.be.null;
+    });
+  });
+
+  describe('Live playlist update errors', function () {
+    it('changes the discontinuity sequence of segment between updates', function () {
+      const playlist1 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:3
+#EXT-X-MEDIA-SEQUENCE:5428
+#EXT-X-DISCONTINUITY-SEQUENCE:31
+#EXT-X-MAP:URI="video_init.mp4"
+#EXTINF:2.000,
+video_5428.m4s
+#EXTINF:2.000,
+video_5429.m4s
+#EXTINF:2.000,
+video_5430.m4s
+#EXTINF:2.000,
+video_5431.m4s`;
+      const playlist2 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:3
+#EXT-X-MEDIA-SEQUENCE:5429
+#EXT-X-DISCONTINUITY-SEQUENCE:31
+#EXT-X-MAP:URI="video_init.mp4"
+#EXTINF:2.000,
+video_5429.m4s
+#EXTINF:2.000,
+video_5430.m4s
+#EXT-X-DISCONTINUITY
+#EXTINF:2.000,
+video_5431.m4s
+#EXTINF:2.000,
+video_5432.m4s`;
+      const details1 = parseLevelPlaylist(playlist1);
+      const details2 = parseLevelPlaylist(playlist2);
+      mergeDetails(details1, details2, logger);
+      expectPlaylistParsingError(
+        details2,
+        'discontinuity sequence mismatch (31!=32)',
+      );
+    });
+
+    it('changes the discontinuity sequence of segment between updates without EXT-X-DISCONTINUITY-SEQUENCE', function () {
+      const playlist1 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:3
+#EXT-X-MEDIA-SEQUENCE:5428
+#EXT-X-MAP:URI="video_init.mp4"
+#EXTINF:2.000,
+video_5428.m4s
+#EXTINF:2.000,
+video_5429.m4s
+#EXTINF:2.000,
+video_5430.m4s
+#EXTINF:2.000,
+video_5431.m4s`;
+      const playlist2 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:3
+#EXT-X-MEDIA-SEQUENCE:5429
+#EXT-X-MAP:URI="video_init.mp4"
+#EXTINF:2.000,
+video_5429.m4s
+#EXTINF:2.000,
+video_5430.m4s
+#EXT-X-DISCONTINUITY
+#EXTINF:2.000,
+video_5431.m4s
+#EXTINF:2.000,
+video_5432.m4s`;
+      const details1 = parseLevelPlaylist(playlist1);
+      const details2 = parseLevelPlaylist(playlist2);
+      mergeDetails(details1, details2, logger);
+      expectPlaylistParsingError(
+        details2,
+        'discontinuity sequence mismatch (0!=1)',
+      );
+    });
+
+    it('changes the discontinuity sequence of the fragment hint between updates', function () {
+      const playlist1 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.500000
+#EXT-X-PART-INF:PART-TARGET=0.500000
+#EXT-X-MEDIA-SEQUENCE:2000
+#EXT-X-DISCONTINUITY-SEQUENCE:1000
+#EXT-X-MAP:URI="init_v1001.m4s"
+#EXTINF:6.000,
+seg_2000.m4s
+#EXTINF:4.000,
+seg_2001.m4s
+#EXT-X-MAP:URI="init_v1002.m4s"
+#EXT-X-PART:DURATION=0.500000,URI="part_2002_0.m4s",INDEPENDENT=YES
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI="part_2002_1.m4s"`;
+      const playlist2 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.500000
+#EXT-X-PART-INF:PART-TARGET=0.500000
+#EXT-X-MEDIA-SEQUENCE:2000
+#EXT-X-DISCONTINUITY-SEQUENCE:1000
+#EXT-X-MAP:URI="init_v1001.m4s"
+#EXTINF:6.000,
+seg_2000.m4s
+#EXTINF:4.000,
+seg_2001.m4s
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="init_v1002.m4s"
+#EXT-X-PART:DURATION=0.500000,URI="part_2002_0.m4s",INDEPENDENT=YES
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI="part_2002_1.m4s"`;
+      const details1 = parseLevelPlaylist(playlist1);
+      const details2 = parseLevelPlaylist(playlist2);
+      expect(details1.fragmentHint)
+        .to.have.property('duration')
+        .which.is.greaterThan(0);
+      mergeDetails(details1, details2, logger);
+      expectPlaylistParsingError(
+        details2,
+        'discontinuity sequence mismatch (1000!=1001)',
+      );
+    });
+
+    it('does not error when a hint with no parts gains a discontinuity with a part update', function () {
+      const playlist1 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.500000
+#EXT-X-PART-INF:PART-TARGET=0.491000
+#EXT-X-MEDIA-SEQUENCE:1993
+#EXT-X-DISCONTINUITY-SEQUENCE:996
+#EXT-X-MAP:URI="init_1_v997.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:25.132+00:00
+#EXTINF:3.989333,
+seg_1_1993.m4s
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="init_1_v998.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:29.121+00:00
+#EXTINF:6.013967,
+seg_1_1994.m4s
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:35.135+00:00
+#EXTINF:4.039156,
+seg_1_1995.m4s
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="init_1_v999.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:39.174+00:00
+#EXTINF:6.015989,
+seg_1_1996.m4s
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:45.190+00:00
+#EXTINF:3.989333,
+seg_1_1997.m4s
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="init_1_v1000.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:49.179+00:00
+#EXTINF:6.013967,
+seg_1_1998.m4s
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:55.193+00:00
+#EXT-X-PART:DURATION=0.487622,URI="part_1_1999_0.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.487622,URI="part_1_1999_1.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.487611,URI="part_1_1999_2.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.487622,URI="part_1_1999_3.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.487622,URI="part_1_1999_4.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.487611,URI="part_1_1999_5.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.487622,URI="part_1_1999_6.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.487622,URI="part_1_1999_7.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.138200,URI="part_1_1999_8.m4s",INDEPENDENT=YES
+#EXTINF:4.039156,
+seg_1_1999.m4s
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="init_1_v1001.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:59.232+00:00
+#EXT-X-PART:DURATION=0.490656,URI="part_1_2000_0.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_1.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_2.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_3.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_4.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_5.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_6.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_7.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_8.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_9.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_10.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_11.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.128000,URI="part_1_2000_12.m4s",INDEPENDENT=YES
+#EXTINF:6.015989,
+seg_1_2000.m4s
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:32:05.248+00:00
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_0.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_1.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_2.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_3.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_4.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_5.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_6.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_7.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.064000,URI="part_1_2001_8.m4s",INDEPENDENT=YES
+#EXTINF:3.989333,
+seg_1_2001.m4s
+#EXT-X-PRELOAD-HINT:TYPE=MAP,URI="init_1_v1002.m4s"
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI="part_1_2002_0.m4s"`;
+      const playlist2 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.500000
+#EXT-X-PART-INF:PART-TARGET=0.491000
+#EXT-X-MEDIA-SEQUENCE:1993
+#EXT-X-DISCONTINUITY-SEQUENCE:996
+#EXT-X-MAP:URI="init_1_v997.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:25.132+00:00
+#EXTINF:3.989333,
+seg_1_1993.m4s
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="init_1_v998.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:29.121+00:00
+#EXTINF:6.013967,
+seg_1_1994.m4s
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:35.135+00:00
+#EXTINF:4.039156,
+seg_1_1995.m4s
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="init_1_v999.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:39.174+00:00
+#EXTINF:6.015989,
+seg_1_1996.m4s
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:45.190+00:00
+#EXTINF:3.989333,
+seg_1_1997.m4s
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="init_1_v1000.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:49.179+00:00
+#EXTINF:6.013967,
+seg_1_1998.m4s
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:55.193+00:00
+#EXTINF:4.039156,
+seg_1_1999.m4s
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="init_1_v1001.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:31:59.232+00:00
+#EXT-X-PART:DURATION=0.490656,URI="part_1_2000_0.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_1.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_2.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_3.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_4.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_5.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_6.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_7.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_8.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_9.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_10.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2000_11.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.128000,URI="part_1_2000_12.m4s",INDEPENDENT=YES
+#EXTINF:6.015989,
+seg_1_2000.m4s
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:32:05.248+00:00
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_0.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_1.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_2.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_3.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_4.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_5.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_6.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.490667,URI="part_1_2001_7.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.064000,URI="part_1_2001_8.m4s",INDEPENDENT=YES
+#EXTINF:3.989333,
+seg_1_2001.m4s
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="init_1_v1002.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2026-08-04T07:32:09.238+00:00
+#EXT-X-PART:DURATION=0.487622,URI="part_1_2002_0.m4s",INDEPENDENT=YES
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI="part_1_2002_1.m4s"`;
+      const details1 = parseLevelPlaylist(playlist1);
+      const details2 = parseLevelPlaylist(playlist2);
+      // sn 2002 is hinted with cc 1000 and no parts, and arrives with cc 1001
+      expect(details1.fragmentHint).to.include({ sn: 2002, cc: 1000 });
+      expect(details1.fragmentHint).to.have.property('duration', 0);
+      expect(details2.fragmentHint).to.include({ sn: 2002, cc: 1001 });
+      mergeDetails(details1, details2, logger);
+      expect(details2.playlistParsingError).to.be.null;
+      // The discontinuity found in the update is preserved
+      expect(details2.fragmentHint).to.have.property('cc', 1001);
+      expect(details2.endCC).to.equal(1001);
+      expect(details2.fragments.map((frag) => frag.cc)).to.deep.equal([
+        996, 997, 997, 998, 998, 999, 999, 1000, 1000,
+      ]);
+    });
+
+    it('changes the media sequence of segment between updates', function () {
+      const playlist1 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:3
+#EXT-X-MEDIA-SEQUENCE:5428
+#EXT-X-DISCONTINUITY-SEQUENCE:31
+#EXT-X-MAP:URI="video_init.mp4"
+#EXTINF:2.000,
+video_5428.m4s
+#EXTINF:2.000,
+video_5429.m4s
+#EXTINF:2.000,
+video_5430.m4s
+#EXTINF:2.000,
+video_5431.m4s`;
+      // Media sequence increased by one but two segments removed.
+      const playlist2 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:3
+#EXT-X-MEDIA-SEQUENCE:5429
+#EXT-X-DISCONTINUITY-SEQUENCE:31
+#EXT-X-MAP:URI="video_init.mp4"
+#EXTINF:2.000,
+video_5430.m4s
+#EXTINF:2.000,
+video_5431.m4s
+#EXTINF:2.000,
+video_5431.m4s
+#EXTINF:2.000,
+video_5432.m4s`;
+      const details1 = parseLevelPlaylist(playlist1);
+      const details2 = parseLevelPlaylist(playlist2);
+      mergeDetails(details1, details2, logger);
+      expectPlaylistParsingError(
+        details2,
+        'media sequence mismatch 5429: http://example.com/video_5430.m4s',
+      );
+    });
+  });
+
+  it('does not error between updates when only the query part of the URI changes', function () {
+    const playlist1 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:3
+#EXT-X-MEDIA-SEQUENCE:5428
+#EXT-X-DISCONTINUITY-SEQUENCE:31
+#EXT-X-MAP:URI="video_init.mp4"
+#EXTINF:2.000,
+video_5428.m4s?t=1
+#EXTINF:2.000,
+video_5429.m4s?t=1
+#EXTINF:2.000,
+video_5430.m4s?t=1
+#EXTINF:2.000,
+video_5431.m4s?t=1`;
+    // Media sequence increased by one but two segments removed.
+    const playlist2 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:3
+#EXT-X-MEDIA-SEQUENCE:5429
+#EXT-X-DISCONTINUITY-SEQUENCE:31
+#EXT-X-MAP:URI="video_init.mp4"
+#EXTINF:2.000,
+video_5429.m4s?t=2
+#EXTINF:2.000,
+video_5430.m4s?t=2
+#EXTINF:2.000,
+video_5431.m4s?t=2
+#EXTINF:2.000,
+video_5432.m4s?t=2`;
+    const details1 = parseLevelPlaylist(playlist1);
+    const details2 = parseLevelPlaylist(playlist2);
+    details2.fragments[0].base.url += '?base=changed';
+    mergeDetails(details1, details2, logger);
+    expect(details2.playlistParsingError).to.be.null;
+  });
+
+  it('maps dateranges based on latest EXT-X-PROGRAM-DATE-TIME', function () {
+    const playlist1 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-MEDIA-SEQUENCE:1
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=9,CAN-SKIP-DATERANGES=YES
+#EXT-X-DATERANGE:ID="D0",START-DATE="2025-08-06T15:59:59Z",DURATION=1
+#EXT-X-DATERANGE:ID="D1",START-DATE="2025-08-06T16:00:00Z",DURATION=12,SCTE35-CMD=0x00000000
+#EXT-X-MAP:URI="hls/20821722-video=2499968.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2025-08-06T16:00:00Z
+#EXTINF:4.0, no desc
+1.m4s
+#EXTINF:4.0, no desc
+2.m4s
+#EXT-X-PROGRAM-DATE-TIME:2025-08-06T16:08:00Z
+#EXTINF:4.0, no desc
+3.m4s
+#EXT-X-DATERANGE:ID="D2",START-DATE="2025-08-06T16:00:15Z",PLANNED-DURATION=12,SCTE35-OUT=0x00000000
+#EXTINF:4.0, no desc
+4.m4s
+#EXTINF:4.0, no desc
+5.m4s
+#EXT-X-PROGRAM-DATE-TIME:2025-08-06T16:00:20Z
+#EXTINF:4.0, no desc
+6.m4s
+#EXTINF:4.0, no desc
+7.m4s
+#EXTINF:4.0, no desc
+8.m4s
+#EXTINF:4.0, no desc
+9.m4s`;
+    // Media sequence increased by one but two segments removed.
+    const playlist2 = `#EXTM3U
+#EXT-X-VERSION:10
+#EXT-X-MEDIA-SEQUENCE:5
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=9,CAN-SKIP-DATERANGES=YES
+#EXT-X-SKIP:SKIPPED-SEGMENTS=4,RECENTLY-REMOVED-DATERANGES="D0"
+#EXTINF:4, no desc
+9.m4s
+#EXTINF:4, no desc
+10.m4s
+#EXT-X-DATERANGE:ID="D3",START-DATE="2025-08-06T16:00:59.100Z",DURATION=12,SCTE35-CMD=0x00000000`;
+    const details1 = parseLevelPlaylist(playlist1);
+    const details2 = parseLevelPlaylist(playlist2);
+
+    expect(details1.playlistParsingError).to.be.null;
+    expect(details2.playlistParsingError).to.be.null;
+
+    // First playilst details
+    expect(details1).to.include({
+      startSN: 1,
+      endSN: 9,
+      totalduration: 36,
+      dateRangeTagCount: 3,
+    });
+    expect(details1.dateRanges).to.have.keys(['D0', 'D1', 'D2']);
+    expect(details1.dateRanges.D0).to.include({
+      startTime: -1,
+      tagOrder: 0,
+    });
+    expect(details1.dateRanges.D0?.tagAnchor).to.include({
+      sn: 1,
+    });
+    expect(details1.dateRanges.D1).to.include({
+      startTime: 0,
+      tagOrder: 1,
+    });
+    expect(details1.dateRanges.D1?.tagAnchor).to.include({
+      sn: 1, // expected to change in details2 after `mergeDetails` when sn: 1 is removed
+    });
+    expect(details1.dateRanges.D2).to.include({
+      startTime: 15,
+      tagOrder: 2,
+    });
+    expect(details1.dateRanges.D2?.tagAnchor).to.include({
+      sn: 6,
+    });
+
+    // Merged delta playlist with EXT-X-PROGRAM-DATE-TIME removed and DateRange tagAnchors updated
+    mergeDetails(details1, details2, logger);
+
+    expect(details2).to.include({
+      startSN: 5,
+      endSN: 10,
+      totalduration: 24,
+      dateRangeTagCount: 1,
+    });
+    expect(details2.dateRanges).to.have.keys(['D1', 'D2', 'D3']);
+    expect(details2.dateRanges.D1).to.include({
+      startTime: 0,
+      tagOrder: 1,
+    });
+    expect(details2.dateRanges.D1?.tagAnchor).to.include({
+      sn: 6,
+    });
+    expect(details2.dateRanges.D2).to.include({
+      startTime: 15,
+      tagOrder: 2,
+    });
+    expect(details2.dateRanges.D2?.tagAnchor).to.include({
+      sn: 6,
+    });
+    expect(details2.dateRanges.D3).to.include({
+      startTime: 59.1,
+      tagOrder: 2, // Note: tagOrder: 3 is expected (following previous/skipped date-ranges), but not critical.
+    });
+    expect(details2.dateRanges.D3?.tagAnchor).to.include({
+      sn: 6,
+    });
+  });
+
+  it('merges new dateranges in delta updates with previous details containing no dateranges', function () {
+    const playlist1 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-MEDIA-SEQUENCE:1
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=9,CAN-SKIP-DATERANGES=YES
+#EXT-X-MAP:URI="hls/20821722-video=2499968.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2025-08-06T16:00:00Z
+#EXTINF:4.0, no desc
+1.m4s
+#EXTINF:4.0, no desc
+2.m4s
+#EXT-X-PROGRAM-DATE-TIME:2025-08-06T16:08:00Z
+#EXTINF:4.0, no desc
+3.m4s
+#EXTINF:4.0, no desc
+4.m4s
+#EXTINF:4.0, no desc
+5.m4s
+#EXT-X-PROGRAM-DATE-TIME:2025-08-06T16:00:20Z
+#EXTINF:4.0, no desc
+6.m4s
+#EXTINF:4.0, no desc
+7.m4s
+#EXTINF:4.0, no desc
+8.m4s
+#EXTINF:4.0, no desc
+9.m4s`;
+    // Media sequence increased by one but two segments removed.
+    const playlist2 = `#EXTM3U
+#EXT-X-VERSION:10
+#EXT-X-MEDIA-SEQUENCE:5
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=9,CAN-SKIP-DATERANGES=YES
+#EXT-X-SKIP:SKIPPED-SEGMENTS=4,RECENTLY-REMOVED-DATERANGES="D0"
+#EXTINF:4, no desc
+9.m4s
+#EXTINF:4, no desc
+10.m4s
+#EXT-X-DATERANGE:ID="D3",START-DATE="2025-08-06T16:00:59.100Z",DURATION=12,SCTE35-CMD=0x00000000`;
+
+    const details1 = parseLevelPlaylist(playlist1);
+    const details2 = parseLevelPlaylist(playlist2);
+
+    expect(details1.playlistParsingError).to.be.null;
+    expect(details2.playlistParsingError).to.be.null;
+
+    // First playilst details
+    expect(details1).to.include({
+      startSN: 1,
+      endSN: 9,
+      totalduration: 36,
+      dateRangeTagCount: 0,
+    });
+    expect(details1.dateRanges).to.be.empty;
+
+    // Merged delta playlist
+    mergeDetails(details1, details2, logger);
+
+    expect(details2).to.include({
+      startSN: 5,
+      endSN: 10,
+      totalduration: 24,
+      dateRangeTagCount: 1,
+    });
+    expect(details2.dateRanges).to.have.keys(['D3']);
+    expect(details2.dateRanges.D3).to.include({
+      startTime: 59.1,
+      tagOrder: 0,
+    });
+    expect(details2.dateRanges.D3?.tagAnchor, 'D3?.tagAnchor').to.include({
+      sn: 6,
+    });
+  });
+
+  it('correctly merges I-FRAMES-ONLY delta playlist updates after segments have been parsed', function () {
+    const playlist1 = `#EXTM3U
+#EXT-X-TARGETDURATION:4
+#EXT-X-MEDIA-SEQUENCE:119183650
+#EXT-X-VERSION:5
+#EXT-X-PART-INF:PART-TARGET=1.10000
+#EXT-X-SERVER-CONTROL:PART-HOLD-BACK=3.00000,CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=24,HOLD-BACK=12
+#EXT-X-I-FRAMES-ONLY
+#EXT-X-MAP:URI="20260408T080505.m4i"
+#EXT-X-KEY:METHOD=NONE
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:16:36.125Z
+#EXTINF:4.000,
+20260408T181636.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:16:40.125Z
+#EXTINF:4.000,
+20260408T181640.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:16:44.125Z
+#EXTINF:4.000,
+20260408T181644.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:16:48.125Z
+#EXTINF:4.000,
+20260408T181648.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:16:52.125Z
+#EXTINF:4.000,
+20260408T181652.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:16:56.125Z
+#EXTINF:4.000,
+20260408T181656.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:00.125Z
+#EXTINF:4.000,
+20260408T181700.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:04.125Z
+#EXTINF:4.000,
+20260408T181704.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:08.125Z
+#EXTINF:4.000,
+20260408T181708.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:12.125Z
+#EXTINF:4.000,
+20260408T181712.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:16.125Z
+#EXTINF:4.000,
+20260408T181716.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:20.125Z
+#EXTINF:4.000,
+20260408T181720.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:24.125Z
+#EXTINF:4.000,
+20260408T181724.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:28.125Z
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181728.1.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181728.2.m4v"
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181728.3.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181728.4.m4v"
+#EXTINF:4.000,
+20260408T181728.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:32.125Z
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181732.1.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181732.2.m4v"
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181732.3.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181732.4.m4v"
+#EXTINF:4.000,
+20260408T181732.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:36.125Z
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181736.1.m4v",INDEPENDENT=YES
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI="20260408T181736.2.m4v"`;
+    // Media sequence increased by one but two segments removed.
+    const playlist2 = `#EXTM3U
+#EXT-X-TARGETDURATION:4
+#EXT-X-MEDIA-SEQUENCE:119183650
+#EXT-X-VERSION:9
+#EXT-X-PART-INF:PART-TARGET=1.10000
+#EXT-X-SERVER-CONTROL:PART-HOLD-BACK=3.00000,CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=24,HOLD-BACK=12
+#EXT-X-I-FRAMES-ONLY
+#EXT-X-SKIP:SKIPPED-SEGMENTS=8
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:08.125Z
+#EXTINF:4.000,
+20260408T181708.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:12.125Z
+#EXTINF:4.000,
+20260408T181712.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:16.125Z
+#EXTINF:4.000,
+20260408T181716.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:20.125Z
+#EXTINF:4.000,
+20260408T181720.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:24.125Z
+#EXTINF:4.000,
+20260408T181724.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:28.125Z
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181728.1.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181728.2.m4v"
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181728.3.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181728.4.m4v"
+#EXTINF:4.000,
+20260408T181728.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:32.125Z
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181732.1.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181732.2.m4v"
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181732.3.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181732.4.m4v"
+#EXTINF:4.000,
+20260408T181732.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-04-08T18:17:36.125Z
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181736.1.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181736.2.m4v"
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181736.3.m4v",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1.00000,URI="20260408T181736.4.m4v"
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI="20260408T181740.1.m4v"`;
+
+    const details1 = parseLevelPlaylist(playlist1);
+    const details2 = parseLevelPlaylist(playlist2);
+
+    expect(details1.playlistParsingError).to.be.null;
+    expect(details2.playlistParsingError).to.be.null;
+
+    // First playilst details
+    expect(details1).to.include({
+      startSN: 119183650,
+      endSN: 119183664,
+      totalduration: 61,
+    });
+
+    const loadedFrag = details1.fragments[13]; // SN 119183663, start=52 in old playlist
+    loadedFrag.startPTS = loadedFrag.start; // 52 (13 * 4)
+    loadedFrag.endPTS = loadedFrag.start + loadedFrag.duration; // 56
+
+    // Merge delta playlist
+    details2.reloaded(details1);
+    mergeDetails(details1, details2, logger);
+
+    expect(details2).to.include({
+      startSN: 119183650,
+      endSN: 119183664,
+      totalduration: 64,
+    });
+
+    expect(details2.fragments.map((f) => f.start)).to.deep.eq([
+      0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56,
+    ]);
+  });
+
+  it('adds and removed dateranges in delta updates with previous details when all previous dateranges are removed', function () {
+    const playlist1 = `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-MEDIA-SEQUENCE:1
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=9,CAN-SKIP-DATERANGES=YES
+#EXT-X-MAP:URI="hls/20821722-video=2499968.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2025-08-06T16:00:00Z
+#EXTINF:4.0, no desc
+1.m4s
+#EXTINF:4.0, no desc
+2.m4s
+#EXTINF:4.0, no desc
+3.m4s
+#EXTINF:4.0, no desc
+4.m4s
+#EXTINF:4.0, no desc
+5.m4s
+#EXTINF:4.0, no desc
+6.m4s
+#EXTINF:4.0, no desc
+7.m4s
+#EXTINF:4.0, no desc
+8.m4s
+#EXTINF:4.0, no desc
+9.m4s
+#EXT-X-DATERANGE:ID="D2",START-DATE="2025-08-06T16:00:15Z",PLANNED-DURATION=12,SCTE35-OUT=0x00000000`;
+    // Media sequence increased by one but two segments removed.
+    const playlist2 = `#EXTM3U
+#EXT-X-VERSION:10
+#EXT-X-MEDIA-SEQUENCE:5
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=9,CAN-SKIP-DATERANGES=YES
+#EXT-X-SKIP:SKIPPED-SEGMENTS=4,RECENTLY-REMOVED-DATERANGES="D2"
+#EXTINF:4, no desc
+9.m4s
+#EXTINF:4, no desc
+10.m4s
+#EXT-X-DATERANGE:ID="D3",START-DATE="2025-08-06T16:00:59.100Z",DURATION=12,SCTE35-CMD=0x00000000`;
+
+    const playlist3 = `#EXTM3U
+#EXT-X-VERSION:10
+#EXT-X-MEDIA-SEQUENCE:6
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=9,CAN-SKIP-DATERANGES=YES
+#EXT-X-SKIP:SKIPPED-SEGMENTS=4,RECENTLY-REMOVED-DATERANGES="D2"
+#EXTINF:4, no desc
+10.m4s
+#EXTINF:4, no desc
+11.m4s
+#EXT-X-DATERANGE:ID="D3",START-DATE="2025-08-06T16:00:59.100Z",DURATION=12,SCTE35-CMD=0x00000000`;
+
+    const playlist4 = `#EXTM3U
+#EXT-X-VERSION:10
+#EXT-X-MEDIA-SEQUENCE:7
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=9,CAN-SKIP-DATERANGES=YES
+#EXT-X-SKIP:SKIPPED-SEGMENTS=4,RECENTLY-REMOVED-DATERANGES="D2	D3"
+#EXTINF:4, no desc
+11.m4s
+#EXTINF:4, no desc
+12.m4s
+#EXT-X-DATERANGE:ID="D4",START-DATE="2025-08-06T16:01:09.100Z",DURATION=12,SCTE35-CMD=0x00000000`;
+
+    const details1 = parseLevelPlaylist(playlist1);
+    const details2 = parseLevelPlaylist(playlist2);
+    const details3 = parseLevelPlaylist(playlist3);
+    const details4 = parseLevelPlaylist(playlist4);
+
+    expect(details1.playlistParsingError).to.be.null;
+    expect(details2.playlistParsingError).to.be.null;
+    expect(details3.playlistParsingError).to.be.null;
+    expect(details4.playlistParsingError).to.be.null;
+
+    // First playilst details
+    expect(details1).to.include({
+      startSN: 1,
+      endSN: 9,
+      totalduration: 36,
+      dateRangeTagCount: 1,
+    });
+    expect(details1.dateRanges).to.have.keys(['D2']);
+
+    // Merge delta playlist
+    mergeDetails(details1, details2, logger);
+
+    expect(details2).to.include({
+      startSN: 5,
+      endSN: 10,
+      totalduration: 24,
+      dateRangeTagCount: 1,
+    });
+    expect(details2.dateRanges).to.have.keys(['D3']);
+    expect(details2.dateRanges.D3).to.include({
+      startTime: 59.1,
+      tagOrder: 0,
+    });
+    expect(details2.dateRanges.D3?.tagAnchor, 'D3?.tagAnchor').to.include({
+      sn: 1,
+    });
+
+    // Merge next delta playlist
+    mergeDetails(details2, details3, logger);
+
+    expect(details3).to.include({
+      startSN: 6,
+      endSN: 11,
+      totalduration: 24,
+      dateRangeTagCount: 1,
+    });
+    expect(details3.dateRanges).to.have.keys(['D3']);
+    expect(details3.dateRanges.D3).to.include({
+      startTime: 59.1,
+      tagOrder: 0,
+    });
+    // `tagAnchor` moved to last segment when no segments with `rawProgramDateTime` (#EXT-X-PROGRAM-DATE-TIME) remain
+    expect(details3.dateRanges.D3?.tagAnchor, 'D3?.tagAnchor').to.include({
+      sn: 11,
+    });
+
+    // Merge next delta playlist
+    mergeDetails(details3, details4, logger);
+
+    expect(details4).to.include({
+      startSN: 7,
+      endSN: 12,
+      totalduration: 24,
+      dateRangeTagCount: 1,
+    });
+    expect(details4.dateRanges).to.have.keys(['D4']);
+    // `tagAnchor` not inherited in new daterange when no segments with `rawProgramDateTime` (#EXT-X-PROGRAM-DATE-TIME) remain
+    expect(details4.dateRanges.D4?.tagAnchor, 'D4?.tagAnchor').to.include({
+      sn: 12,
+    });
+    expect(details4.dateRanges.D4).to.include({
+      startTime: 69.1,
+      tagOrder: 0,
+    });
+  });
+});
+
+function parseLevelPlaylist(
+  m3u8: string,
+  url?: string,
+  type?: PlaylistLevelType,
+) {
+  return M3U8Parser.parseLevelPlaylist(
+    m3u8,
+    url || 'http://example.com/playlist.m3u8',
+    0,
+    type || PlaylistLevelType.MAIN,
+    0,
+    null,
+  );
+}
+
+function expectPlaylistParsingError(object: any, message: string) {
+  expect(
+    object,
+    object?.playlistParsingError ? undefined : 'playlistParsingError',
+  )
+    .to.have.property('playlistParsingError')
+    .which.is.an('Error')
+    .which.has.property('message')
+    .which.is.a('string')
+    .which.satisfy(
+      (msg: string) => msg.startsWith(message),
+      `Expected error message to start with "${message}"`,
+    );
+}

@@ -1,0 +1,26 @@
+{
+  "extends": "./tsconfig-lib.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "emitDeclarationOnly": false
+  },
+  "include": [
+    "src/**/*",
+    "tests/**/*",
+    "demo/**/*",
+    /* needed for eslint to work for some reason ¯\_(ツ)_/¯ */
+    ".eslintrc.js",
+    "karma.conf.js",
+    "tests/**/.eslintrc.js",
+    "rollup.config.js",
+    "build-config.js",
+    "lint-staged.config.js",
+    "scripts/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist/**/*",
+    "demo/libs/**/*",
+    "tests/integration/dist-types/**/*"
+  ]
+}

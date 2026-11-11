@@ -1,0 +1,1332 @@
+import { expect, use } from 'chai';
+import { EventEmitter } from 'eventemitter3';
+import { fakeXhr } from 'nise';
+import sinon from 'sinon';
+import sinonChai from 'sinon-chai';
+import EMEController from '../../../src/controller/eme-controller';
+import { ErrorDetails } from '../../../src/errors';
+import { Events } from '../../../src/events';
+import { Fragment } from '../../../src/loader/fragment';
+import { LevelKey } from '../../../src/loader/level-key';
+import { PlaylistLevelType } from '../../../src/types/loader';
+import {
+  KeySystemFormats,
+  KeySystems,
+} from '../../../src/utils/mediakeys-helper';
+import HlsMock from '../../mocks/hls.mock';
+import type { MediaKeySessionContext } from '../../../src/controller/eme-controller';
+import type { EncryptedFragment } from '../../../src/loader/fragment';
+import type { MediaAttachedData } from '../../../src/types/events';
+
+use(sinonChai);
+
+type EMEControllerTestable = Omit<EMEController, 'hls' | 'mediaKeySessions'> & {
+  hls: HlsMock;
+  mediaKeySessions: MediaKeySessionContext[];
+  activeKeys: {
+    main?: EncryptedFragment;
+    audio?: EncryptedFragment;
+    previous?: EncryptedFragment[];
+  };
+  onMediaAttached: (
+    event: Events.MEDIA_ATTACHED,
+    data: MediaAttachedData,
+  ) => void;
+  onMediaDetached: () => void;
+  onManifestLoading: () => void;
+  attemptSetMediaKeys: (
+    keySystem: KeySystems,
+    mediaKeys: MediaKeys,
+  ) => Promise<void>;
+  onManifestLoaded: (
+    event: Events.MANIFEST_LOADED,
+    data: { sessionKeys: LevelKey[] },
+  ) => void;
+  media: HTMLMediaElement | null;
+  keyFormatPromise: Promise<KeySystemFormats> | null;
+  getKeyStatuses: (mediaKeySessionContext: MediaKeySessionContext) => {
+    [keyId: string]: MediaKeyStatus;
+  };
+};
+
+class MediaMock extends EventEmitter {
+  setMediaKeys: sinon.SinonSpy<[mediaKeys: MediaKeys | null], Promise<void>>;
+  addEventListener: any;
+  removeEventListener: any;
+  constructor() {
+    super();
+    this.setMediaKeys = sinon.spy((mediaKeys: MediaKeys | null) =>
+      Promise.resolve(),
+    );
+    this.addEventListener = this.addListener.bind(this);
+    this.removeEventListener = this.removeListener.bind(this);
+  }
+}
+
+class MediaKeysMock implements MediaKeys {
+  createSession(/* sessionType?: MediaKeySessionType */) {
+    return new MediaKeySessionMock();
+  }
+  getStatusForPolicy(/* policy?: MediaKeysPolicy */) {
+    // "output-restricted" | "released" | "status-pending" | "usable" | "usable-in-future"
+    return Promise.resolve('usable' as MediaKeyStatus);
+  }
+  setServerCertificate(/* serverCertificate: BufferSource */) {
+    return Promise.resolve(true);
+  }
+}
+
+class MediaKeySessionMock extends EventEmitter implements MediaKeySession {
+  addEventListener: any;
+  removeEventListener: any;
+  private _resolveClose: (reason: MediaKeySessionClosedReason) => void =
+    () => {};
+  protected _keyStatuses: Map<Uint8Array, string>;
+  readonly closed: Promise<MediaKeySessionClosedReason>;
+  readonly keyStatuses: MediaKeyStatusMap;
+  readonly expiration: number;
+  readonly onkeystatuseschange = null; // use add/removeEventListener
+  readonly onmessage = null; // use add/removeEventListener
+  readonly sessionId: string;
+
+  constructor() {
+    super();
+    this.addEventListener = this.addListener.bind(this);
+    this.removeEventListener = this.removeListener.bind(this);
+    this.closed = new Promise((resolve) => {
+      this._resolveClose = resolve;
+    });
+    this.expiration = NaN;
+    this.sessionId = '';
+
+    const keyStatuses = (this._keyStatuses = new Map());
+    this.keyStatuses = {
+      get size() {
+        return keyStatuses.size;
+      },
+      get(keyId) {
+        return keyStatuses.get(keyId);
+      },
+      has(keyId) {
+        return keyStatuses.has(keyId);
+      },
+      forEach(callbackfn, thisArg?) {
+        return keyStatuses.forEach(callbackfn, thisArg);
+      },
+    } as any as MediaKeyStatusMap; // missing entries, keys, and values of Iterable
+  }
+  dispatchEvent() {
+    return true;
+  }
+  close() {
+    this._resolveClose('release-acknoledged' as MediaKeySessionClosedReason);
+    return this.closed.then(() => {});
+  }
+  generateRequest() {
+    return Promise.resolve().then(() => {
+      this.emit('message', {
+        messageType: 'license-request',
+        message: new Uint8Array(0),
+      });
+      this._keyStatuses.set(new Uint8Array(16), 'usable');
+      this.emit('keystatuseschange', {});
+    });
+  }
+  load(sessionId: string) {
+    return Promise.reject(new Error('not supported'));
+  }
+  remove() {
+    return Promise.resolve();
+  }
+  update() {
+    return Promise.resolve();
+  }
+}
+
+let emeController: EMEControllerTestable;
+let media: MediaMock;
+let sinonFakeXMLHttpRequestStatic: sinon.SinonFakeXMLHttpRequestStatic;
+
+const setupEach = function (config) {
+  const hls = new HlsMock(config);
+  hls.levelController = {
+    levels: [
+      {
+        audioCodec: 'audio/foo',
+      },
+      {
+        videoCodec: 'video/foo',
+      },
+    ],
+  };
+  media = new MediaMock();
+  emeController = new EMEController(hls as any) as any as EMEControllerTestable;
+  sinonFakeXMLHttpRequestStatic = fakeXhr.useFakeXMLHttpRequest();
+};
+
+const getParsedLevelKey = (
+  uri: string = 'data://key-uri',
+  format: string = 'com.apple.streamingkeydelivery',
+) => {
+  const levelKey = new LevelKey('SAMPLE-AES', uri, format);
+  levelKey.keyId = new Uint8Array(16);
+  levelKey.pssh = new Uint8Array(16);
+  return levelKey;
+};
+
+const getEncryptedFrag = (levelKey: LevelKey) => {
+  const encryptedFrag = new Fragment(PlaylistLevelType.MAIN, '');
+  encryptedFrag.levelkeys = {
+    [levelKey.keyFormat]: levelKey,
+  };
+  encryptedFrag.setKeyFormat(levelKey.keyFormat as KeySystemFormats);
+  return encryptedFrag as EncryptedFragment;
+};
+
+const drain = () =>
+  new Promise<void>((resolve) => self.setTimeout(() => resolve(), 0));
+
+describe('EMEController', function () {
+  beforeEach(function () {
+    setupEach({});
+  });
+
+  afterEach(function () {
+    sinonFakeXMLHttpRequestStatic.restore();
+  });
+
+  it('should request keysystem access based on key format when `emeEnabled` is true', function () {
+    const mediaKeys = new MediaKeysMock();
+    const reqMediaKsAccessSpy = sinon.spy(function () {
+      return Promise.resolve({
+        // Media-keys mock
+        keySystem: 'com.apple.fps',
+        createMediaKeys: sinon.spy(() => Promise.resolve(mediaKeys)),
+      });
+    });
+
+    setupEach({
+      emeEnabled: true,
+      drmSystems: {
+        'com.apple.fps': {
+          licenseUrl: 'http://noop',
+        },
+      },
+      requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+    });
+
+    sinonFakeXMLHttpRequestStatic.onCreate = (
+      xhr: sinon.SinonFakeXMLHttpRequest,
+    ) => {
+      self.setTimeout(() => {
+        (xhr as any).response = new Uint8Array();
+        xhr.respond(200, {}, '');
+      }, 0);
+    };
+
+    emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+      media: media as any as HTMLMediaElement,
+    });
+
+    expect(media.setMediaKeys).callCount(0);
+    expect(reqMediaKsAccessSpy).callCount(0);
+
+    const levelKey = getParsedLevelKey();
+    const encryptedFrag = getEncryptedFrag(levelKey);
+    const emePromise = emeController.loadKey(encryptedFrag);
+
+    expect(emePromise).to.be.a('Promise');
+    return emePromise.finally(() => {
+      expect(media.setMediaKeys).callCount(1);
+      expect(reqMediaKsAccessSpy).callCount(1);
+    });
+  });
+
+  it('should request keys with specified robustness options when `emeEnabled` is true', function () {
+    const reqMediaKsAccessSpy = sinon.spy(function () {
+      return Promise.resolve({
+        // Media-keys mock
+        keySystem: 'com.apple.fps',
+        createMediaKeys: sinon.spy(() =>
+          Promise.resolve({
+            setServerCertificate: () => Promise.resolve(),
+            createSession: () => new MediaKeySessionMock(),
+          }),
+        ),
+      });
+    });
+
+    setupEach({
+      emeEnabled: true,
+      drmSystems: {
+        'com.apple.fps': {
+          licenseUrl: 'http://noop',
+        },
+      },
+      drmSystemOptions: {
+        audioRobustness: 'HW_SECURE_ALL',
+        videoRobustness: 'HW_SECURE_ALL',
+      },
+      requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+    });
+
+    sinonFakeXMLHttpRequestStatic.onCreate = (
+      xhr: sinon.SinonFakeXMLHttpRequest,
+    ) => {
+      self.setTimeout(() => {
+        (xhr as any).response = new Uint8Array();
+        xhr.respond(200, {}, '');
+      }, 0);
+    };
+
+    emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+      media: media as any as HTMLMediaElement,
+    });
+
+    expect(media.setMediaKeys).callCount(0);
+    expect(reqMediaKsAccessSpy).callCount(0);
+
+    const levelKey = getParsedLevelKey();
+    const encryptedFrag = getEncryptedFrag(levelKey);
+    const emePromise = emeController.loadKey(encryptedFrag);
+
+    expect(emePromise).to.be.a('Promise');
+    return emePromise.finally(() => {
+      expect(reqMediaKsAccessSpy).callCount(1);
+      const args = reqMediaKsAccessSpy.getCall(0)
+        .args as MediaKeySystemConfiguration[][];
+      const baseConfig: MediaKeySystemConfiguration = args[1][0];
+      expect(baseConfig.audioCapabilities)
+        .to.be.an('array')
+        .with.property('0')
+        .with.property('robustness', 'HW_SECURE_ALL');
+      expect(baseConfig.videoCapabilities)
+        .to.be.an('array')
+        .with.property('0')
+        .with.property('robustness', 'HW_SECURE_ALL');
+    });
+  });
+
+  it('should ignore "encrypted" events with bad data', function () {
+    const reqMediaKsAccessSpy = sinon.spy(function () {
+      return Promise.resolve({
+        // Media-keys mock
+        keySystem: 'com.apple.fps',
+        createMediaKeys: sinon.spy(() =>
+          Promise.resolve({
+            setServerCertificate: () => Promise.resolve(),
+            createSession: () => ({
+              addEventListener: () => {},
+              removeEventListener: () => {},
+              generateRequest: () => Promise.reject(new Error('bad data')),
+              remove: () => Promise.resolve(),
+              update: () => Promise.resolve(),
+              keyStatuses: new Map(),
+            }),
+          }),
+        ),
+      });
+    });
+
+    setupEach({
+      emeEnabled: true,
+      requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+      drmSystems: {
+        'com.apple.fps': {
+          licenseUrl: '.',
+        },
+      },
+    });
+
+    const badData = {
+      initDataType: 'cenc',
+      initData: new Uint8Array([
+        // box size
+        0, 0, 0, 44,
+        // "PSSH"
+        112, 115, 115, 104,
+        // version
+        0, 0, 0, 0,
+        // Widevine system id
+        237, 239, 139, 169, 121, 214, 74, 206, 163, 200, 39, 220, 213, 29, 33,
+        237,
+        // data size
+        0, 0, 0, 12,
+        // data (incomplete key)
+        0, 0, 0, 0, 0, 0, 0, 0, 240, 0, 186, 0,
+      ]).buffer,
+    };
+
+    emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+      media: media as any as HTMLMediaElement,
+    });
+
+    media.emit('encrypted', badData);
+
+    return emeController
+      .selectKeySystemFormat({
+        levelkeys: {
+          [KeySystemFormats.FAIRPLAY]: {},
+          [KeySystemFormats.WIDEVINE]: {},
+          [KeySystemFormats.PLAYREADY]: {},
+        },
+        sn: 0,
+        type: 'main',
+      } as any)
+      .then(() => {
+        expect(emeController.activeKeys).to.deep.equal(
+          {},
+          '`activeKeys` should be an empty dictionary when no playlisty-keys are found',
+        );
+      });
+  });
+
+  it('should exchange keyID and status if keyStatuses forEach callback error', function () {
+    class MediaKeySessionMock2 extends MediaKeySessionMock {
+      constructor() {
+        super();
+        this._keyStatuses.set(new Uint8Array(16), 'usable');
+      }
+    }
+
+    setupEach({
+      emeEnabled: true,
+      requestMediaKeySystemAccessFunc: sinon.spy(),
+      drmSystems: {
+        'com.apple.fps': {
+          serverCertificateUrl: 'https://example.com/certificate.cer',
+        },
+      },
+    });
+
+    const keySession = new MediaKeySessionMock2();
+    const levelKey = getParsedLevelKey();
+    const mockMediaKeySessionContext: MediaKeySessionContext = {
+      keySystem: KeySystems.FAIRPLAY,
+      mediaKeys: new MediaKeysMock(),
+      mediaKeysSession: keySession,
+      keyRequests: {},
+      keyStatuses: {},
+      createdFor: { levelKey, reason: 'playlist-key' },
+      initialized: false,
+    };
+
+    const keyStatuses = emeController.getKeyStatuses(
+      mockMediaKeySessionContext,
+    );
+    expect(keyStatuses)
+      .to.have.property('00000000000000000000000000000000')
+      .which.equals('usable');
+  });
+
+  it('should fetch the server certificate and set it into the session', function () {
+    const mediaKeysSetServerCertificateSpy = sinon.spy(() => Promise.resolve());
+
+    const reqMediaKsAccessSpy = sinon.spy(function () {
+      return Promise.resolve({
+        // Media-keys mock
+        keySystem: 'com.apple.fps',
+        createMediaKeys: sinon.spy(() =>
+          Promise.resolve({
+            setServerCertificate: mediaKeysSetServerCertificateSpy,
+            createSession: () => new MediaKeySessionMock(),
+          }),
+        ),
+      });
+    });
+
+    setupEach({
+      emeEnabled: true,
+      requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+      drmSystems: {
+        'com.apple.fps': {
+          serverCertificateUrl: 'https://example.com/certificate.cer',
+          licenseUrl: 'https://example.com/license',
+        },
+      },
+    });
+
+    sinonFakeXMLHttpRequestStatic.onCreate = (
+      xhr: sinon.SinonFakeXMLHttpRequest,
+    ) => {
+      self.setTimeout(() => {
+        xhr.respond(200, {}, 'abcdef');
+      }, 0);
+    };
+
+    emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+      media: media as any as HTMLMediaElement,
+    });
+
+    const levelKey = getParsedLevelKey();
+    const encryptedFrag = getEncryptedFrag(levelKey);
+    return emeController.loadKey(encryptedFrag).then(() => {
+      expect(mediaKeysSetServerCertificateSpy).to.have.been.calledOnce;
+      expect(mediaKeysSetServerCertificateSpy).to.have.been.calledWith(
+        sinon.match({ byteLength: 6 }),
+      );
+    });
+  });
+
+  it('should fetch the server certificate and trigger update failed error', function () {
+    const mediaKeysSetServerCertificateSpy = sinon.spy(() =>
+      Promise.reject(new Error('Failed')),
+    );
+
+    const reqMediaKsAccessSpy = sinon.spy(function () {
+      return Promise.resolve({
+        // Media-keys mock
+        keySystem: 'com.apple.fps',
+        createMediaKeys: sinon.spy(() =>
+          Promise.resolve({
+            setServerCertificate: mediaKeysSetServerCertificateSpy,
+            createSession: () => ({
+              addEventListener: () => {},
+              removeEventListener: () => {},
+              generateRequest: () => Promise.resolve(),
+              remove: () => Promise.resolve(),
+              update: () => Promise.resolve(),
+              keyStatuses: new Map(),
+            }),
+          }),
+        ),
+      });
+    });
+
+    setupEach({
+      emeEnabled: true,
+      requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+      drmSystems: {
+        'com.apple.fps': {
+          serverCertificateUrl: 'https://example.com/certificate.cer',
+        },
+      },
+    });
+
+    let xhrInstance;
+    sinonFakeXMLHttpRequestStatic.onCreate = (
+      xhr: sinon.SinonFakeXMLHttpRequest,
+    ) => {
+      xhrInstance = xhr;
+      self.setTimeout(() => {
+        (xhr as any).response = new Uint8Array();
+        xhr.respond(200, {}, '');
+      }, 0);
+    };
+
+    const levelKey = getParsedLevelKey();
+    levelKey.pssh = null;
+    const encryptedFrag = getEncryptedFrag(levelKey);
+
+    emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+      media: media as any as HTMLMediaElement,
+    });
+
+    emeController
+      .loadKey(encryptedFrag)
+      .catch(() => {})
+      .finally(() => {
+        expect(mediaKeysSetServerCertificateSpy).to.have.been.calledOnce;
+        expect((mediaKeysSetServerCertificateSpy.args[0] as any)[0]).to.equal(
+          xhrInstance.response,
+        );
+
+        expect(emeController.hls.trigger).to.have.been.calledOnce;
+        expect(emeController.hls.trigger.args[0][1].details).to.equal(
+          ErrorDetails.KEY_SYSTEM_SERVER_CERTIFICATE_UPDATE_FAILED,
+        );
+      });
+  });
+
+  it('should fetch the server certificate and trigger request failed error', function () {
+    const reqMediaKsAccessSpy = sinon.spy(function () {
+      return Promise.resolve({
+        // Media-keys mock
+        keySystem: 'com.apple.fps',
+        createMediaKeys: sinon.spy(() =>
+          Promise.resolve({
+            createSession: () => ({
+              addEventListener: () => {},
+              removeEventListener: () => {},
+              generateRequest: () => Promise.resolve(),
+              remove: () => Promise.resolve(),
+              update: () => Promise.resolve(),
+              keyStatuses: new Map(),
+            }),
+          }),
+        ),
+      });
+    });
+
+    setupEach({
+      emeEnabled: true,
+      requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+      drmSystems: {
+        'com.apple.fps': {
+          serverCertificateUrl: 'https://example.com/certificate.cer',
+        },
+      },
+    });
+
+    sinonFakeXMLHttpRequestStatic.onCreate = (
+      xhr: sinon.SinonFakeXMLHttpRequest,
+    ) => {
+      self.setTimeout(() => {
+        xhr.status = 400;
+        xhr.error();
+      }, 0);
+    };
+
+    const levelKey = getParsedLevelKey();
+    levelKey.pssh = null;
+    const encryptedFrag = getEncryptedFrag(levelKey);
+
+    emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+      media: media as any as HTMLMediaElement,
+    });
+    emeController
+      .loadKey(encryptedFrag)
+      .catch(() => {})
+      .finally(() => {
+        expect(emeController.hls.trigger).to.have.been.calledOnce;
+        expect(emeController.hls.trigger.args[0][1].details).to.equal(
+          ErrorDetails.KEY_SYSTEM_SERVER_CERTIFICATE_REQUEST_FAILED,
+        );
+      });
+  });
+
+  it('should reject pending session-key key-system selection with invalid state when destroyed', function () {
+    let resolveKeySystemAccess!: (value: MediaKeySystemAccess) => void;
+    const keySystemAccessPromise = new Promise<MediaKeySystemAccess>(
+      (resolve) => {
+        resolveKeySystemAccess = resolve;
+      },
+    );
+    const createMediaKeysSpy = sinon.spy(() =>
+      Promise.resolve(new MediaKeysMock()),
+    );
+    const reqMediaKsAccessSpy = sinon.spy(() => keySystemAccessPromise);
+
+    setupEach({
+      emeEnabled: true,
+      requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+      drmSystems: {
+        'com.apple.fps': {},
+      },
+    });
+
+    const levelKey = getParsedLevelKey();
+
+    emeController.onManifestLoaded(Events.MANIFEST_LOADED, {
+      sessionKeys: [levelKey],
+    });
+
+    const keyFormatPromise = emeController.keyFormatPromise;
+    if (!keyFormatPromise) {
+      throw new Error('Expected pending key-system selection');
+    }
+
+    emeController.destroy();
+    const mediaKeySystemAccess: MediaKeySystemAccess = {
+      keySystem: KeySystems.FAIRPLAY,
+      createMediaKeys: createMediaKeysSpy,
+      getConfiguration: () => ({}),
+    };
+    resolveKeySystemAccess(mediaKeySystemAccess);
+
+    return keyFormatPromise.then(
+      () => {
+        throw new Error('Expected key-system selection to reject');
+      },
+      (error) => {
+        expect(error).to.be.instanceOf(Error);
+        expect(error.message).to.equal('invalid state');
+        expect(createMediaKeysSpy).not.to.have.been.called;
+      },
+    );
+  });
+
+  it('should handle unused session-key key-system selection rejections', function () {
+    let rejectKeySystemAccess!: (error: Error) => void;
+    const keySystemAccessPromise = new Promise<MediaKeySystemAccess>(
+      (resolve, reject) => {
+        rejectKeySystemAccess = reject;
+      },
+    );
+    let unhandledRejection: PromiseRejectionEvent | null = null;
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      unhandledRejection = event;
+      event.preventDefault();
+    };
+
+    self.addEventListener('unhandledrejection', onUnhandledRejection);
+
+    setupEach({
+      emeEnabled: true,
+      requestMediaKeySystemAccessFunc: () => keySystemAccessPromise,
+      drmSystems: {
+        'com.apple.fps': {},
+      },
+    });
+
+    emeController.onManifestLoaded(Events.MANIFEST_LOADED, {
+      sessionKeys: [getParsedLevelKey()],
+    });
+
+    const keyFormatPromise = emeController.keyFormatPromise;
+    if (!keyFormatPromise) {
+      throw new Error('Expected key-system selection promise');
+    }
+
+    rejectKeySystemAccess(new Error('key-system access failed'));
+
+    return new Promise<void>((resolve) => {
+      self.setTimeout(resolve, 0);
+    })
+      .then(() => {
+        expect(unhandledRejection).to.equal(null);
+        expect(emeController.hls.trigger).not.to.have.been.called;
+        return keyFormatPromise.then(
+          () => {
+            throw new Error('Expected key-system selection to reject');
+          },
+          (error) => {
+            expect(error).to.be.instanceOf(Error);
+            expect(error.message).to.equal('key-system access failed');
+          },
+        );
+      })
+      .finally(() => {
+        self.removeEventListener('unhandledrejection', onUnhandledRejection);
+      });
+  });
+
+  it('should remove media property  when media is detached', function () {
+    const reqMediaKsAccessSpy = sinon.spy(function () {
+      return Promise.resolve({
+        // Media-keys mock
+        keySystem: 'com.apple.fps',
+        createMediaKeys: sinon.spy(() =>
+          Promise.resolve({
+            setServerCertificate: () => Promise.resolve(),
+            createSession: () => ({
+              addEventListener: () => {},
+              removeEventListener: () => {},
+              generateRequest: () => Promise.resolve(),
+              remove: () => Promise.resolve(),
+              update: () => Promise.resolve(),
+              keyStatuses: new Map(),
+            }),
+          }),
+        ),
+      });
+    });
+
+    setupEach({
+      emeEnabled: true,
+      requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+    });
+
+    emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+      media: media as any as HTMLMediaElement,
+    });
+
+    const keySession = new MediaKeySessionMock();
+    const levelKey = getParsedLevelKey();
+    const mockMediaKeySessionContext: MediaKeySessionContext = {
+      keySystem: KeySystems.FAIRPLAY,
+      mediaKeys: new MediaKeysMock(),
+      mediaKeysSession: keySession,
+      keyRequests: {},
+      keyStatuses: {},
+      createdFor: { levelKey, reason: 'playlist-key' },
+      initialized: false,
+    };
+
+    emeController.mediaKeySessions = [mockMediaKeySessionContext];
+    emeController.destroy();
+
+    expect(emeController.media).to.equal(null);
+  });
+
+  it('should close all media key sessions and remove media keys when call destroy', function () {
+    const reqMediaKsAccessSpy = sinon.spy(function () {
+      return Promise.resolve({
+        // Media-keys mock
+        keySystem: 'com.apple.fps',
+        createMediaKeys: sinon.spy(() =>
+          Promise.resolve({
+            setServerCertificate: () => Promise.resolve(),
+            createSession: () => ({
+              addEventListener: () => {},
+              removeEventListener: () => {},
+              generateRequest: () => Promise.resolve(),
+              remove: () => Promise.resolve(),
+              update: () => Promise.resolve(),
+              keyStatuses: new Map(),
+            }),
+          }),
+        ),
+      });
+    });
+
+    setupEach({
+      emeEnabled: true,
+      requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+    });
+
+    emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+      media: media as any as HTMLMediaElement,
+    });
+
+    const keySession = new MediaKeySessionMock();
+    const levelKey = getParsedLevelKey();
+    const mockMediaKeySessionContext: MediaKeySessionContext = {
+      keySystem: KeySystems.FAIRPLAY,
+      mediaKeys: new MediaKeysMock(),
+      mediaKeysSession: keySession,
+      keyRequests: {},
+      keyStatuses: {},
+      createdFor: { levelKey, reason: 'playlist-key' },
+      initialized: false,
+    };
+    const keySessionCloseSpy = sinon.spy(keySession, 'close');
+
+    emeController.mediaKeySessions = [mockMediaKeySessionContext];
+    emeController.destroy();
+
+    expect(EMEController.CDMCleanupPromise).to.be.a('Promise');
+    if (!EMEController.CDMCleanupPromise) {
+      return;
+    }
+    return EMEController.CDMCleanupPromise.then(() => {
+      expect(keySessionCloseSpy).callCount(1);
+      expect(emeController.mediaKeySessions.length).to.equal(0);
+      expect(media.setMediaKeys).calledWith(null);
+    });
+  });
+
+  it('should remove all media key sessions and remove all media key sessions when call destroy with persistent-license session type', function () {
+    const reqMediaKsAccessSpy = sinon.spy(function () {
+      return Promise.resolve({
+        // Media-keys mock
+        keySystem: 'com.apple.fps',
+        createMediaKeys: sinon.spy(() =>
+          Promise.resolve({
+            setServerCertificate: () => Promise.resolve(),
+            createSession: () => ({
+              addEventListener: () => {},
+              removeEventListener: () => {},
+              generateRequest: () => Promise.resolve(),
+              remove: () => Promise.resolve(),
+              update: () => Promise.resolve(),
+              keyStatuses: new Map(),
+            }),
+          }),
+        ),
+      });
+    });
+
+    setupEach({
+      emeEnabled: true,
+      requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+      drmSystemOptions: {
+        sessionType: 'persistent-license',
+      },
+    });
+
+    emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+      media: media as any as HTMLMediaElement,
+    });
+
+    const keySession = new MediaKeySessionMock();
+    const levelKey = getParsedLevelKey();
+    const mockMediaKeySessionContext: MediaKeySessionContext = {
+      keySystem: KeySystems.FAIRPLAY,
+      mediaKeys: new MediaKeysMock(),
+      mediaKeysSession: keySession,
+      keyRequests: {},
+      keyStatuses: {},
+      createdFor: { levelKey, reason: 'playlist-key' },
+      initialized: false,
+    };
+    const keySessionCloseSpy = sinon.spy(keySession, 'close');
+
+    emeController.mediaKeySessions = [mockMediaKeySessionContext];
+    emeController.destroy();
+
+    expect(EMEController.CDMCleanupPromise).to.be.a('Promise');
+    if (!EMEController.CDMCleanupPromise) {
+      return;
+    }
+    return EMEController.CDMCleanupPromise.then(() => {
+      expect(keySessionCloseSpy).callCount(1);
+      expect(emeController.mediaKeySessions.length).to.equal(0);
+    });
+  });
+
+  describe('reusing MediaKeys across loadSource (#8092 - Not for FPS)', function () {
+    let reqMediaKsAccessSpy: sinon.SinonSpy;
+
+    beforeEach(function () {
+      reqMediaKsAccessSpy = sinon.spy(() =>
+        Promise.resolve({
+          keySystem: 'com.widevine.alpha',
+          createMediaKeys: () => Promise.resolve(new MediaKeysMock()),
+        }),
+      );
+      setupEach({
+        emeEnabled: true,
+        drmSystems: { 'com.widevine.alpha': { licenseUrl: 'http://noop' } },
+        requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+      });
+      sinonFakeXMLHttpRequestStatic.onCreate = (xhr) => {
+        self.setTimeout(() => {
+          // Sessions closed on MANIFEST_LOADING abort their license requests
+          if ((xhr as any).aborted) {
+            return;
+          }
+          (xhr as any).response = new Uint8Array();
+          xhr.respond(200, {}, '');
+        }, 0);
+      };
+      // Chrome cannot remove or replace MediaKeys that are in use
+      media.setMediaKeys = sinon.spy((keys: MediaKeys | null) => {
+        const attachedKeys = (media as any).mediaKeys;
+        if (attachedKeys && keys && attachedKeys !== keys) {
+          return Promise.reject(new Error('InvalidStateError'));
+        }
+        (media as any).mediaKeys = keys;
+        return Promise.resolve();
+      });
+      emeController.hls.media = media;
+      emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+        media: media as any as HTMLMediaElement,
+      });
+    });
+
+    it('reuses MediaKeys when MANIFEST_LOADING fires with media attached (Widevine)', async function () {
+      await emeController.loadKey(
+        getEncryptedFrag(
+          getParsedLevelKey(
+            'data://key-uri',
+            'urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed',
+          ),
+        ),
+      );
+      // loadSource with the same url and nothing buffered keeps media attached
+      emeController.onManifestLoading();
+      await emeController.loadKey(
+        getEncryptedFrag(
+          getParsedLevelKey(
+            'data://key-uri-2',
+            'urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed',
+          ),
+        ),
+      );
+
+      expect(reqMediaKsAccessSpy).callCount(1);
+      expect(media.setMediaKeys).callCount(1);
+    });
+
+    it('reuses MediaKeys when media is re-attached before MANIFEST_LOADING (Widevine)', async function () {
+      await emeController.loadKey(
+        getEncryptedFrag(
+          getParsedLevelKey(
+            'data://key-uri',
+            'urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed',
+          ),
+        ),
+      );
+      // loadSource with a source loaded detaches and re-attaches media before MANIFEST_LOADING
+      emeController.onMediaDetached();
+      emeController.onManifestLoading();
+      emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+        media: media as any as HTMLMediaElement,
+      });
+      await emeController.loadKey(
+        getEncryptedFrag(
+          getParsedLevelKey(
+            'data://key-uri-2',
+            'urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed',
+          ),
+        ),
+      );
+
+      expect(reqMediaKsAccessSpy).callCount(1);
+      expect(media.setMediaKeys).callCount(1);
+    });
+
+    it('Does not resuse MediaKeys when MANIFEST_LOADING fires with media attached with FairPlay Streaming', async function () {
+      await emeController.loadKey(
+        getEncryptedFrag(getParsedLevelKey('data://key-uri')),
+      );
+      // loadSource with the same url and nothing buffered keeps media attached
+      emeController.onManifestLoading();
+      await emeController.loadKey(
+        getEncryptedFrag(getParsedLevelKey('data://key-uri-2')),
+      );
+
+      expect(reqMediaKsAccessSpy).callCount(2);
+      expect(media.setMediaKeys).to.have.been.calledWith(null);
+      expect(media.setMediaKeys).callCount(3);
+    });
+  });
+
+  it('should wait for media keys to be cleared before setting new MediaKeys', async function () {
+    setupEach({ emeEnabled: true });
+    let resolveClear!: () => void;
+    const setMediaKeys = sinon.spy((keys: MediaKeys | null) =>
+      keys
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            resolveClear = resolve;
+          }),
+    );
+    media.setMediaKeys = setMediaKeys;
+    emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+      media: media as any as HTMLMediaElement,
+    });
+
+    await emeController.attemptSetMediaKeys(
+      KeySystems.WIDEVINE,
+      new MediaKeysMock(),
+    );
+    // Load a source that does not reuse the attached MediaKeys
+    emeController.onManifestLoading();
+    const newMediaKeys = new MediaKeysMock();
+    const attached = emeController.attemptSetMediaKeys(
+      KeySystems.WIDEVINE,
+      newMediaKeys,
+    );
+    await drain();
+    const callCountBeforeCleared = setMediaKeys.callCount;
+    // Resolve before asserting so CDMCleanupPromise does not block other tests
+    resolveClear();
+    await attached;
+
+    expect(callCountBeforeCleared).to.equal(2);
+    expect(setMediaKeys).callCount(3);
+    expect(setMediaKeys.args[1][0]).to.equal(null);
+    expect(setMediaKeys.args[2][0]).to.equal(newMediaKeys);
+  });
+
+  it('should set MediaKeys after a previous setMediaKeys call was rejected', async function () {
+    setupEach({ emeEnabled: true });
+    const setMediaKeys = sinon.stub<[MediaKeys | null], Promise<void>>();
+    setMediaKeys.onFirstCall().rejects(new Error('InvalidStateError'));
+    setMediaKeys.resolves();
+    media.setMediaKeys = setMediaKeys;
+    emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+      media: media as any as HTMLMediaElement,
+    });
+    const attempt = (mediaKeys: MediaKeys) =>
+      (emeController as any).attemptSetMediaKeys(
+        KeySystems.WIDEVINE,
+        mediaKeys,
+      );
+
+    await attempt(new MediaKeysMock()).catch(() => {});
+    await attempt(new MediaKeysMock());
+
+    expect(setMediaKeys).callCount(2);
+  });
+
+  it('should set MediaKeys queued behind a setMediaKeys call that is rejected', async function () {
+    setupEach({ emeEnabled: true });
+    let rejectFirst!: (error: Error) => void;
+    const setMediaKeys = sinon.stub<[MediaKeys | null], Promise<void>>();
+    setMediaKeys.onFirstCall().returns(
+      new Promise<void>((resolve, reject) => {
+        rejectFirst = reject;
+      }),
+    );
+    setMediaKeys.resolves();
+    media.setMediaKeys = setMediaKeys;
+    emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+      media: media as any as HTMLMediaElement,
+    });
+
+    const first = emeController.attemptSetMediaKeys(
+      KeySystems.WIDEVINE,
+      new MediaKeysMock(),
+    );
+    const second = emeController.attemptSetMediaKeys(
+      KeySystems.WIDEVINE,
+      new MediaKeysMock(),
+    );
+    await drain();
+    rejectFirst(new Error('InvalidStateError'));
+    await first.catch(() => {});
+    await second;
+
+    expect(setMediaKeys).callCount(2);
+  });
+
+  describe('serialized key-session setup (#7796)', function () {
+    class DeferredMediaKeySessionMock extends MediaKeySessionMock {
+      generateRequest() {
+        this.emit('message', {
+          messageType: 'license-request',
+          message: new Uint8Array(0),
+        });
+        // Do not auto-publish key statuses — tests drive timing manually.
+        return Promise.resolve();
+      }
+
+      publishKeyStatus(keyId: Uint8Array<ArrayBuffer> = new Uint8Array(16)) {
+        this._keyStatuses.set(keyId, 'usable');
+        this.emit('keystatuseschange', {});
+      }
+    }
+
+    const buildKsAccessSpy = (sessions: DeferredMediaKeySessionMock[]) => {
+      const createSessionSpy = sinon.spy(() => {
+        const session = new DeferredMediaKeySessionMock();
+        sessions.push(session);
+        return session;
+      });
+      const reqMediaKsAccessSpy = sinon.spy(function () {
+        return Promise.resolve({
+          keySystem: 'com.apple.fps',
+          createMediaKeys: sinon.spy(() =>
+            Promise.resolve({
+              setServerCertificate: () => Promise.resolve(),
+              createSession: createSessionSpy,
+            }),
+          ),
+        });
+      });
+      return { reqMediaKsAccessSpy, createSessionSpy };
+    };
+
+    const respondToXhrEmpty = () => {
+      sinonFakeXMLHttpRequestStatic.onCreate = (
+        xhr: sinon.SinonFakeXMLHttpRequest,
+      ) => {
+        self.setTimeout(() => {
+          (xhr as any).response = new Uint8Array();
+          xhr.respond(200, {}, '');
+        }, 0);
+      };
+    };
+
+    it('blocks concurrent loadKey for the same URI on a single session', function () {
+      const sessions: DeferredMediaKeySessionMock[] = [];
+      const { reqMediaKsAccessSpy, createSessionSpy } =
+        buildKsAccessSpy(sessions);
+      setupEach({
+        emeEnabled: true,
+        drmSystems: { 'com.apple.fps': { licenseUrl: 'http://noop' } },
+        requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+      });
+      respondToXhrEmpty();
+      emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+        media: media as any as HTMLMediaElement,
+      });
+
+      const levelKey = getParsedLevelKey();
+      const pA = emeController.loadKey(getEncryptedFrag(levelKey));
+      const pB = emeController.loadKey(getEncryptedFrag(levelKey));
+
+      return drain()
+        .then(() => {
+          expect(createSessionSpy).callCount(1);
+          sessions[0].publishKeyStatus();
+          return Promise.all([pA, pB]);
+        })
+        .then(() => {
+          expect(createSessionSpy).callCount(1);
+          expect(emeController.mediaKeySessions.length).to.equal(1);
+        });
+    });
+
+    it('creates distinct concurrent sessions for distinct URIs', function () {
+      const sessions: DeferredMediaKeySessionMock[] = [];
+      const { reqMediaKsAccessSpy, createSessionSpy } =
+        buildKsAccessSpy(sessions);
+      setupEach({
+        emeEnabled: true,
+        drmSystems: { 'com.apple.fps': { licenseUrl: 'http://noop' } },
+        requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+      });
+      respondToXhrEmpty();
+      emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+        media: media as any as HTMLMediaElement,
+      });
+
+      // Distinct keyIds mirror real HLS where different key URIs map to
+      // different keys. Distinct URIs do not block each other — FPS in
+      // particular relies on parallel session setup.
+      const keyA = getParsedLevelKey('data://key-uri-A');
+      keyA.keyId = new Uint8Array(16).fill(0xa1);
+      const keyB = getParsedLevelKey('data://key-uri-B');
+      keyB.keyId = new Uint8Array(16).fill(0xb2);
+      const fragA = getEncryptedFrag(keyA);
+      const fragB = getEncryptedFrag(keyB);
+
+      const pA = emeController.loadKey(fragA);
+      const pB = emeController.loadKey(fragB);
+
+      return drain()
+        .then(() => {
+          // Distinct URIs run in parallel — each gets its own session.
+          expect(createSessionSpy).callCount(2);
+          sessions[0].publishKeyStatus(keyA.keyId!);
+          sessions[1].publishKeyStatus(keyB.keyId!);
+          return Promise.all([pA, pB]);
+        })
+        .then(() => {
+          expect(emeController.mediaKeySessions.length).to.equal(2);
+        });
+    });
+
+    it('does not orphan blocked callers when the first session setup fails', function () {
+      const sessions: DeferredMediaKeySessionMock[] = [];
+      const createSessionSpy = sinon.spy(() => {
+        const session = new DeferredMediaKeySessionMock();
+        if (sessions.length === 0) {
+          (session as any).generateRequest = () =>
+            Promise.reject(new Error('first session failed'));
+        }
+        sessions.push(session);
+        return session;
+      });
+      const reqMediaKsAccessSpy = sinon.spy(function () {
+        return Promise.resolve({
+          keySystem: 'com.apple.fps',
+          createMediaKeys: sinon.spy(() =>
+            Promise.resolve({
+              setServerCertificate: () => Promise.resolve(),
+              createSession: createSessionSpy,
+            }),
+          ),
+        });
+      });
+      setupEach({
+        emeEnabled: true,
+        drmSystems: { 'com.apple.fps': { licenseUrl: 'http://noop' } },
+        requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+      });
+      respondToXhrEmpty();
+      emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+        media: media as any as HTMLMediaElement,
+      });
+
+      const levelKey = getParsedLevelKey();
+      const pA = emeController
+        .loadKey(getEncryptedFrag(levelKey))
+        .catch(() => undefined);
+      const pB = emeController.loadKey(getEncryptedFrag(levelKey));
+
+      return drain()
+        .then(() => drain())
+        .then(() => {
+          // After A's failure, B should drive a fresh session creation.
+          expect(createSessionSpy.callCount).to.be.at.least(1);
+          if (sessions.length >= 2) {
+            sessions[1].publishKeyStatus();
+          }
+          return Promise.all([pA, pB]);
+        })
+        .then(() => {
+          expect(createSessionSpy.callCount).to.be.at.least(2);
+          expect(emeController.mediaKeySessions.length).to.equal(1);
+        });
+    });
+  });
+
+  describe('setting MediaKeys while media is detached', function () {
+    it('sets MediaKeys on attach when the same MediaKeys are requested again while waiting', function () {
+      setupEach({ emeEnabled: true });
+      const mediaKeys = new MediaKeysMock();
+      const first = emeController.attemptSetMediaKeys(
+        KeySystems.FAIRPLAY,
+        mediaKeys,
+      );
+
+      return drain().then(() => {
+        // e.g. a second key load while an interstitial has the media element
+        const second = emeController.attemptSetMediaKeys(
+          KeySystems.FAIRPLAY,
+          mediaKeys,
+        );
+        expect(media.setMediaKeys).callCount(0);
+        emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+          media: media as any as HTMLMediaElement,
+        });
+        expect(media.setMediaKeys).callCount(1);
+        expect(media.setMediaKeys).calledWith(mediaKeys);
+        return Promise.all([first, second]);
+      });
+    });
+
+    it('sets MediaKeys on attach when different MediaKeys are requested while waiting', async function () {
+      setupEach({ emeEnabled: true });
+      const first = emeController.attemptSetMediaKeys(
+        KeySystems.FAIRPLAY,
+        new MediaKeysMock(),
+      );
+      await drain();
+      const secondMediaKeys = new MediaKeysMock();
+      const second = emeController.attemptSetMediaKeys(
+        KeySystems.FAIRPLAY,
+        secondMediaKeys,
+      );
+      await drain();
+      emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+        media: media as any as HTMLMediaElement,
+      });
+      await Promise.all([first, second]);
+
+      expect(media.setMediaKeys).callCount(2);
+      expect(media.setMediaKeys.args[1][0]).to.equal(secondMediaKeys);
+    });
+
+    it('sets MediaKeys on attach when they were removed from the media while detached', async function () {
+      setupEach({ emeEnabled: true });
+      const mediaKeys = new MediaKeysMock();
+      media.setMediaKeys = sinon.spy((keys: MediaKeys | null) => {
+        (media as any).mediaKeys = keys;
+        return Promise.resolve();
+      });
+      emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+        media: media as any as HTMLMediaElement,
+      });
+      await emeController.attemptSetMediaKeys(KeySystems.FAIRPLAY, mediaKeys);
+
+      emeController.onMediaDetached();
+      // e.g. cleared by an interstitial asset player
+      (media as any).mediaKeys = null;
+      const attached = emeController.attemptSetMediaKeys(
+        KeySystems.FAIRPLAY,
+        mediaKeys,
+      );
+      await drain();
+      emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+        media: media as any as HTMLMediaElement,
+      });
+      await attached;
+
+      expect(media.setMediaKeys).callCount(2);
+      expect((media as any).mediaKeys).to.equal(mediaKeys);
+    });
+
+    it('does not clear key IDs on destroy after media with MediaKeys of another player is detached', function () {
+      setupEach({ emeEnabled: true });
+      // e.g. an interstitial asset player attached to media with the primary player's MediaKeys
+      (media as any).mediaKeys = new MediaKeysMock();
+      const clearKeyIdsSpy = sinon.spy(LevelKey, 'clearKeyUriToKeyIdMap');
+      emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+        media: media as any as HTMLMediaElement,
+      });
+
+      emeController.onMediaDetached();
+      emeController.destroy();
+      const keyIdsCleared = clearKeyIdsSpy.called;
+      clearKeyIdsSpy.restore();
+
+      expect(keyIdsCleared).to.be.false;
+    });
+  });
+});

@@ -1,0 +1,35 @@
+{
+  "extends": ["config:recommended"],
+  "labels": ["dependencies", "skip-change-log"],
+  "schedule": ["* 6-12 * * 1-4"],
+  "prHourlyLimit": 3,
+  "prConcurrentLimit": 1,
+  "prCreation": "immediate",
+  "minimumReleaseAge": "7 days",
+  "internalChecksFilter": "strict",
+  "vulnerabilityAlerts": {
+    "addLabels": ["security"]
+  },
+  "major": {
+    "addLabels": ["semver-major"]
+  },
+  "ignoreDeps": ["@types/chart.js", "ace", "chart.js", "FileSaver.js"],
+  "packageRules": [
+    {
+      "matchDatasources": ["html"],
+      "enabled": false
+    },
+    {
+      "rangeStrategy": "bump",
+      "matchPackageNames": ["*"]
+    },
+    {
+      "matchDepTypes": ["devDependencies"],
+      "rangeStrategy": "pin"
+    },
+    {
+      "matchDepTypes": ["peerDependencies"],
+      "rangeStrategy": "widen"
+    }
+  ]
+}

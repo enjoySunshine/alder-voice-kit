@@ -1,0 +1,409 @@
+import { expect, use } from 'chai';
+import sinon from 'sinon';
+import sinonChai from 'sinon-chai';
+import CapLevelController from '../../../src/controller/cap-level-controller';
+import { Events } from '../../../src/events';
+import Hls from '../../../src/hls';
+import { Level } from '../../../src/types/level';
+import { parsedLevel } from '../../mocks/mock-level';
+
+use(sinonChai);
+
+const parsedLevels = [
+  parsedLevel({
+    width: 360,
+    height: 360,
+    bitrate: 1000,
+  }),
+  parsedLevel({
+    width: 540,
+    height: 540,
+    bitrate: 2000,
+  }),
+  parsedLevel({
+    width: 540,
+    height: 540,
+    bitrate: 3000,
+  }),
+  parsedLevel({
+    width: 720,
+    height: 720,
+    bitrate: 4000,
+  }),
+];
+const levels = parsedLevels.map((parsedLevel) => new Level(parsedLevel));
+
+class MockResizeObserver {
+  private callback?: (entries) => void;
+  constructor(callback) {
+    this.callback = callback;
+  }
+  observe(element) {
+    Promise.resolve()
+      .then(() => {
+        const contentRect = element.getBoundingClientRect();
+        this.callback?.([{ contentRect }]);
+      })
+      .catch(() => {});
+  }
+  unobserve() {}
+  disconnect() {
+    this.callback = undefined;
+  }
+}
+
+describe('CapLevelController', function () {
+  describe('getMaxLevelByMediaSize', function () {
+    it('Should choose the level whose dimensions are >= the media dimensions', function () {
+      const expected = 0;
+      const actual = CapLevelController.getMaxLevelByMediaSize(
+        levels,
+        300,
+        300,
+      );
+      expect(expected).to.equal(actual);
+    });
+
+    it('Should choose the level whose bandwidth is greater if level dimensions are equal', function () {
+      const expected = 2;
+      const actual = CapLevelController.getMaxLevelByMediaSize(
+        levels,
+        500,
+        500,
+      );
+      expect(expected).to.equal(actual);
+    });
+
+    it('Should choose the highest level if the media is greater than every level', function () {
+      const expected = 3;
+      const actual = CapLevelController.getMaxLevelByMediaSize(
+        levels,
+        5000,
+        5000,
+      );
+      expect(expected).to.equal(actual);
+    });
+
+    it('Should return -1 if there levels is empty', function () {
+      const expected = -1;
+      const actual = CapLevelController.getMaxLevelByMediaSize([], 5000, 5000);
+      expect(expected).to.equal(actual);
+    });
+  });
+
+  describe('getDimensions', function () {
+    let hls;
+    let media;
+    let capLevelController;
+
+    beforeEach(function () {
+      const fixture = document.createElement('div');
+      fixture.id = 'test-fixture';
+      document.body.appendChild(fixture);
+
+      hls = new Hls({ capLevelToPlayerSize: true });
+      media = document.createElement('video');
+      capLevelController = hls.capLevelController;
+      capLevelController.onMediaAttaching(Events.MEDIA_ATTACHING, {
+        media,
+      });
+      capLevelController.onManifestParsed(Events.MANIFEST_PARSED, {
+        levels,
+      });
+    });
+
+    afterEach(function () {
+      if (media.parentNode) {
+        media.parentNode.removeChild(media);
+      }
+      const fixture = document.querySelector('#test-fixture');
+      if (fixture) {
+        document.body.removeChild(fixture);
+      }
+      hls.destroy();
+    });
+
+    it('gets 0 for width and height when the media element is not in the DOM', function () {
+      const bounds = capLevelController.getDimensions();
+      expect(bounds.width).to.equal(0);
+      expect(bounds.height).to.equal(0);
+      expect(capLevelController.mediaWidth).to.equal(0);
+      expect(capLevelController.mediaHeight).to.equal(0);
+    });
+
+    it('gets width and height attributes when the media element is not in the DOM', function () {
+      media.setAttribute('width', 320);
+      media.setAttribute('height', 240);
+      const pixelRatio = capLevelController.contentScaleFactor;
+      const bounds = capLevelController.getDimensions();
+      expect(bounds.width).to.equal(320);
+      expect(bounds.height).to.equal(240);
+      expect(capLevelController.mediaWidth).to.equal(320 * pixelRatio);
+      expect(capLevelController.mediaHeight).to.equal(240 * pixelRatio);
+    });
+
+    it('gets client bounds width and height when media element is in the DOM', function () {
+      media.style.width = '1280px';
+      media.style.height = '720px';
+
+      const fixture = document.querySelector('#test-fixture');
+      if (!fixture) {
+        expect(fixture).is.not.null;
+        return;
+      }
+      fixture.appendChild(media);
+
+      const pixelRatio = capLevelController.contentScaleFactor;
+      const bounds = capLevelController.getDimensions();
+      expect(bounds.width).to.equal(1280);
+      expect(bounds.height).to.equal(720);
+      expect(capLevelController.mediaWidth).to.equal(1280 * pixelRatio);
+      expect(capLevelController.mediaHeight).to.equal(720 * pixelRatio);
+    });
+
+    it('gets valid width and height when the media element is attached after onManifestParsed', function () {
+      hls = new Hls({ capLevelToPlayerSize: true });
+      capLevelController = hls.capLevelController;
+      capLevelController.onManifestParsed(Events.MANIFEST_PARSED, {
+        levels,
+      });
+
+      let bounds = capLevelController.getDimensions();
+      expect(bounds.width).to.equal(0);
+      expect(bounds.height).to.equal(0);
+      expect(capLevelController.mediaWidth).to.equal(0);
+      expect(capLevelController.mediaHeight).to.equal(0);
+
+      media.style.width = '1280px';
+      media.style.height = '720px';
+
+      const fixture = document.querySelector('#test-fixture');
+      if (!fixture) {
+        expect(fixture).is.not.null;
+        return;
+      }
+      fixture.appendChild(media);
+
+      capLevelController.onMediaAttaching(Events.MEDIA_ATTACHING, {
+        media,
+      });
+      const pixelRatio = capLevelController.contentScaleFactor;
+      bounds = capLevelController.getDimensions();
+      expect(bounds.width).to.equal(1280);
+      expect(bounds.height).to.equal(720);
+      expect(capLevelController.mediaWidth).to.equal(1280 * pixelRatio);
+      expect(capLevelController.mediaHeight).to.equal(720 * pixelRatio);
+    });
+  });
+
+  describe('capping with a stable player size', function () {
+    let hls;
+    let media;
+    let capLevelController;
+    let mediaLevels: Level[];
+
+    beforeEach(function () {
+      const fixture = document.createElement('div');
+      fixture.id = 'test-fixture';
+      document.body.appendChild(fixture);
+
+      media = document.createElement('video');
+      media.style.width = '500px';
+      media.style.height = '500px';
+      fixture.appendChild(media);
+
+      hls = new Hls({
+        capLevelToPlayerSize: true,
+        ignoreDevicePixelRatio: true,
+      });
+      capLevelController = hls.capLevelController;
+      // Levels are unknown until the manifest is parsed
+      mediaLevels = [];
+      Object.defineProperty(hls, 'levels', {
+        configurable: true,
+        get: () => mediaLevels,
+      });
+      // Mock ResizeObserver to avoid race between observer callback and async test assertions
+      sinon.stub(self, 'ResizeObserver').value(MockResizeObserver);
+    });
+
+    afterEach(function () {
+      const fixture = document.querySelector('#test-fixture');
+      if (fixture) {
+        document.body.removeChild(fixture);
+      }
+      hls.destroy();
+      sinon.restore();
+    });
+
+    it('caps to the observed player size on MANIFEST_PARSED', function () {
+      capLevelController.onMediaAttaching(Events.MEDIA_ATTACHING, {
+        media,
+      });
+      return Promise.resolve().then(() => {
+        expect(
+          hls.autoLevelCapping,
+          'autoLevelCapping before MANIFEST_PARSED',
+        ).to.equal(-1);
+
+        mediaLevels = levels;
+        capLevelController.onManifestParsed(Events.MANIFEST_PARSED, {
+          levels,
+          video: {},
+        });
+
+        expect(
+          hls.autoLevelCapping,
+          'autoLevelCapping after MANIFEST_PARSED',
+        ).to.equal(2);
+      });
+    });
+
+    it('caps to the observed player size on LEVELS_UPDATED', function () {
+      capLevelController.onMediaAttaching(Events.MEDIA_ATTACHING, {
+        media,
+      });
+      return Promise.resolve().then(() => {
+        mediaLevels = levels;
+        capLevelController.onLevelsUpdated(Events.LEVELS_UPDATED, {
+          levels,
+        });
+        expect(hls.autoLevelCapping).to.equal(2);
+      });
+    });
+  });
+
+  describe('initialization', function () {
+    let hls;
+    let capLevelController;
+    let startCappingSpy;
+    let stopCappingSpy;
+    beforeEach(function () {
+      hls = new Hls({ capLevelToPlayerSize: true });
+      capLevelController = hls.capLevelController;
+      startCappingSpy = sinon.spy(capLevelController, 'startCapping');
+      stopCappingSpy = sinon.spy(capLevelController, 'stopCapping');
+    });
+
+    this.afterEach(function () {
+      hls.destroy();
+    });
+
+    describe('start and stop', function () {
+      it('immediately caps and begins monitoring size', function () {
+        const detectPlayerSizeSpy = sinon.spy(
+          capLevelController,
+          'detectPlayerSize',
+        );
+        capLevelController.startCapping();
+
+        expect(capLevelController.timer || capLevelController.observer).to
+          .exist;
+        expect(detectPlayerSizeSpy.callCount).to.equal(1);
+      });
+
+      it('stops the capping timer and resets capping', function () {
+        capLevelController.autoLevelCapping = 4;
+        capLevelController.timer = 1;
+        capLevelController.stopCapping();
+
+        expect(capLevelController.autoLevelCapping).to.equal(
+          Number.POSITIVE_INFINITY,
+        );
+        expect(capLevelController.restrictedLevels).to.be.empty;
+        expect(capLevelController.timer).to.not.exist;
+      });
+    });
+
+    it('constructs with no restrictions', function () {
+      expect(capLevelController.restrictedLevels).to.be.empty;
+      expect(capLevelController.timer).to.not.exist;
+      expect(capLevelController.autoLevelCapping).to.equal(
+        Number.POSITIVE_INFINITY,
+      );
+    });
+
+    it('starts capping on BUFFER_CODECS only if video is found', function () {
+      capLevelController.onBufferCodecs(Events.BUFFER_CODECS, { video: {} });
+      expect(startCappingSpy.calledOnce).to.be.true;
+    });
+
+    it('does not start capping on BUFFER_CODECS if video is not found', function () {
+      capLevelController.onBufferCodecs(Events.BUFFER_CODECS, { audio: {} });
+      expect(startCappingSpy.notCalled).to.be.true;
+    });
+
+    it('starts capping if the video codec was found after the audio codec', function () {
+      capLevelController.onBufferCodecs(Events.BUFFER_CODECS, { audio: {} });
+      expect(startCappingSpy.notCalled).to.be.true;
+
+      capLevelController.onBufferCodecs(Events.BUFFER_CODECS, { video: {} });
+      expect(startCappingSpy.calledOnce).to.be.true;
+    });
+
+    it('resets restrictedLevels on MANIFEST_PARSED', function () {
+      capLevelController.restrictedLevels = [1];
+      capLevelController.onManifestParsed(Events.MANIFEST_PARSED, {
+        levels: [{ foo: 'bar' }],
+      });
+      expect(capLevelController.restrictedLevels).to.be.empty;
+    });
+
+    it('should start capping in MANIFEST_PARSED if a video codec was signaled in the manifest', function () {
+      capLevelController.onManifestParsed(Events.MANIFEST_PARSED, {
+        video: {},
+      });
+      expect(startCappingSpy.calledOnce).to.be.true;
+    });
+
+    it('does not start capping on MANIFEST_PARSED if no video codec was signaled in the manifest', function () {
+      capLevelController.onManifestParsed(Events.MANIFEST_PARSED, {
+        levels: [{}],
+        altAudio: true,
+      });
+      expect(startCappingSpy.notCalled).to.be.true;
+    });
+
+    describe('capLevelToPlayerSize', function () {
+      let streamController;
+      let nextLevelSwitchSpy;
+
+      beforeEach(function () {
+        // For these tests, we need the original HLS object to refer to our manually created capLevelController.
+        hls.capLevelController = capLevelController;
+        streamController = hls.streamController;
+
+        nextLevelSwitchSpy = sinon.spy(streamController, 'nextLevelSwitch');
+        capLevelController.onManifestParsed(Events.MANIFEST_PARSED, {
+          levels,
+          video: {},
+        });
+      });
+
+      it('continues capping without second timer', function () {
+        hls.capLevelToPlayerSize = true;
+        expect(startCappingSpy.calledOnce).to.be.true;
+      });
+
+      it('stops the capping timer and resets capping', function () {
+        hls.capLevelToPlayerSize = false;
+        expect(stopCappingSpy.calledOnce).to.be.true;
+      });
+
+      it('calls for nextLevelSwitch when stopped capping', function () {
+        hls.capLevelToPlayerSize = false;
+        expect(nextLevelSwitchSpy.calledOnce).to.be.true;
+      });
+
+      it('updates config state of capping on change', function () {
+        hls.capLevelToPlayerSize = false;
+        expect(hls.config.capLevelToPlayerSize).to.be.false;
+      });
+
+      it('stops capping when destroyed', function () {
+        capLevelController.destroy();
+        expect(stopCappingSpy.calledOnce).to.be.true;
+      });
+    });
+  });
+});
