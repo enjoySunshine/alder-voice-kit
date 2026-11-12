@@ -4,6 +4,7 @@ import './unit/events';
 import './e2e/cmcd';
 import './unit/controller/abr-controller';
 import './unit/controller/audio-stream-controller';
+import './unit/controller/audio-subtitle-track-selection';
 import './unit/controller/audio-track-controller';
 import './unit/controller/base-stream-controller';
 import './unit/controller/buffer-controller-operations';
